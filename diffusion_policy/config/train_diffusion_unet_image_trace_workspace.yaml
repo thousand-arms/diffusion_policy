@@ -73,15 +73,23 @@ ema:
   max_value: 0.9999
 
 dataloader:
-  batch_size: 64
-  num_workers: 4
+  # batch_size and num_workers sized for the 30 GB RAM laptop: the
+  # dataset returns (T=16, 3, 224, 224) float32 per cam per sample (~19
+  # MB), so each batch × num_workers × prefetch_factor(2) sits in /dev/shm
+  # as the DataLoader shuttles tensors back to the main process. At
+  # batch_size=64 / num_workers=4 this was ~18 GB of shmem-rss and OOM'd.
+  # 32 / 2 keeps shared memory around ~2.5 GB. On a bigger box, raise
+  # both back up or refactor the dataset to keep images as uint8 until
+  # the GPU.
+  batch_size: 32
+  num_workers: 2
   shuffle: True
   pin_memory: True
   persistent_workers: False
 
 val_dataloader:
-  batch_size: 64
-  num_workers: 4
+  batch_size: 32
+  num_workers: 2
   shuffle: False
   pin_memory: True
   persistent_workers: False
@@ -140,14 +148,14 @@ checkpoint:
   save_last_snapshot: False
 
 multi_run:
-  run_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  run_dir: /mnt/thousand-arms-data/outputs/trace/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
   wandb_name_base: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
 
 hydra:
   job:
     override_dirname: ${name}
   run:
-    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+    dir: /mnt/thousand-arms-data/outputs/trace/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
   sweep:
-    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+    dir: /mnt/thousand-arms-data/outputs/trace/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
     subdir: ${hydra.job.num}
