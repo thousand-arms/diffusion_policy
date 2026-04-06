@@ -1,0 +1,44 @@
+name: trace_image
+
+image_shape: &image_shape [3, 224, 224]
+shape_meta: &shape_meta
+  # acceptable types: rgb, low_dim
+  obs:
+    cam0:
+      shape: *image_shape
+      type: rgb
+    cam1:
+      shape: *image_shape
+      type: rgb
+    cam_pos:
+      shape: [3]
+      type: low_dim
+    cam_rot_6d:
+      shape: [6]
+      type: low_dim
+  action:
+    shape: [9]
+
+dataset_path: &dataset_path /home/andrew/Dev/stereo_inertial_data_collection/data/test/dataset.zarr.zip
+
+# No simulator for this real-world task. Reuse the existing no-op runner
+# the same way UMI does in its own task/umi.yaml.
+env_runner:
+  _target_: diffusion_policy.env_runner.real_pusht_image_runner.RealPushTImageRunner
+
+dataset:
+  _target_: diffusion_policy.dataset.trace_dataset.TraceDataset
+  zarr_path: *dataset_path
+  # LMDB cache dir. Source zarr is copied here once per mtime and then
+  # opened readonly+mmap — see TraceDataset docstring. Path is relative
+  # to the repo root; hydra cwd changes don't touch it because it's
+  # rebuilt into an abspath by the dataset itself.
+  cache_dir: /home/andrew/Dev/diffusion_policy/data/cache/trace_dataset
+  horizon: ${horizon}
+  n_obs_steps: ${dataset_obs_steps}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.05
+  max_train_episodes: null
+  image_normalization: identity

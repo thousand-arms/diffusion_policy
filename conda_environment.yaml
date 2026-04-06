@@ -19,6 +19,9 @@ dependencies:
   - ipykernel=6.16
   - matplotlib=3.6.1
   - zarr=2.12.0
+  # Enables zarr.LMDBStore for the mtime-stamped training cache in
+  # TraceDataset. Matches UMI's pinned version.
+  - python-lmdb=1.4
   - numcodecs=0.10.2
   - h5py=3.7.0
   - hydra-core=1.2.0
