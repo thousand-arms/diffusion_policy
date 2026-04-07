@@ -14,6 +14,7 @@ from omegaconf import OmegaConf
 import pathlib
 from torch.utils.data import DataLoader
 import copy
+import gc
 import random
 import wandb
 import tqdm
@@ -278,6 +279,15 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
 
                     if topk_ckpt_path is not None:
                         self.save_checkpoint(path=topk_ckpt_path)
+
+                    # Reclaim transient memory from the pickle buffers
+                    # used by save_checkpoint() before the next epoch's
+                    # dataloader workers fork. Without this, the parent
+                    # RSS stays inflated through fork+shmem allocation
+                    # and OOM-kills the process at the start of the next
+                    # epoch on a 30 GB RAM laptop.
+                    gc.collect()
+                    torch.cuda.empty_cache()
                 # ========= eval end for this epoch ==========
                 policy.train()
 
