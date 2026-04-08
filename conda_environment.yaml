@@ -54,15 +54,15 @@ dependencies:
   # trick to force reinstall imagecodecs via pip
   - imagecodecs==2022.8.8
   - pip:
-    - ray[default,tune]==2.2.0
-    # requires mujoco py dependencies libosmesa6-dev libgl1-mesa-glx libglfw3 patchelf
-    - free-mujoco-py==2.1.6
-    - pygame==2.1.2
-    - pybullet-svl==3.1.6.4
-    - robosuite @ https://github.com/cheng-chi/robosuite/archive/277ab9588ad7a4f4b55cf75508b44aa67ec171f0.tar.gz
-    - robomimic==0.2.0
-    - pytorchvideo==0.1.5
-    # pip package required for jpeg-xl
+    # pip package required for jpeg-xl (overrides the conda-forge wheel above)
     - imagecodecs==2022.9.26
-    - r3m @ https://github.com/facebookresearch/r3m/archive/b2334e726887fa0206962d7984c69c5fb09cceab.tar.gz
-    - dm-control==1.0.9
+  # ---------------------------------------------------------------------------
+  # Sim-only dependencies stripped for the welding/trace fork (real-world data,
+  # no mujoco/robosuite/pybullet). The original upstream list had:
+  #   ray[default,tune], free-mujoco-py, pygame, pybullet-svl, robosuite,
+  #   robomimic, pytorchvideo, r3m, dm-control
+  # None are imported by the trace training path (trace_dataset,
+  # train_diffusion_unet_image_workspace, diffusion_unet_image_policy,
+  # multi_image_obs_encoder, real_pusht_image_runner). free-mujoco-py / mujoco
+  # in particular tried to build from source and failed on MUJOCO_PATH.
+  # ---------------------------------------------------------------------------

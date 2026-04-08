@@ -1,0 +1,85 @@
+{
+  "name": "Diffusion Policy Sandbox",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "args": {
+      "TZ": "${localEnv:TZ:Asia/Shanghai}",
+      "CLAUDE_CODE_VERSION": "latest",
+      "GIT_DELTA_VERSION": "0.18.2",
+      "ZSH_IN_DOCKER_VERSION": "1.2.0",
+      "USER_UID": "1000",
+      "USER_GID": "1000"
+    }
+  },
+  "runArgs": [
+    "--cap-add=NET_ADMIN",
+    "--cap-add=NET_RAW",
+    "--gpus", "all",
+    "--shm-size=8g"
+  ],
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "anthropic.claude-code",
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "ms-toolsai.jupyter",
+        "ms-toolsai.tensorboard",
+        "charliermarsh.ruff",
+        "eamodio.gitlens"
+      ],
+      "settings": {
+        "editor.formatOnSave": true,
+        "[python]": {
+          "editor.defaultFormatter": "charliermarsh.ruff",
+          "editor.codeActionsOnSave": {
+            "source.fixAll.ruff": "explicit"
+          }
+        },
+        "python.defaultInterpreterPath": "/opt/conda/envs/robodiff/bin/python",
+        "python.terminal.activateEnvInCurrentTerminal": true,
+        "terminal.integrated.defaultProfile.linux": "zsh",
+        "terminal.integrated.profiles.linux": {
+          "bash": { "path": "bash", "icon": "terminal-bash" },
+          "zsh":  { "path": "zsh" }
+        }
+      }
+    }
+  },
+  "remoteUser": "vscode",
+  "mounts": [
+    "source=diffusion-policy-bashhistory-${devcontainerId},target=/commandhistory,type=volume",
+    "source=diffusion-policy-claude-config-${devcontainerId},target=/home/vscode/.claude,type=volume",
+    "source=diffusion-policy-conda-envs,target=/opt/conda/envs,type=volume",
+    "source=/mnt/thousand-arms-data,target=/mnt/thousand-arms-data,type=bind,consistency=delegated",
+    // Host credentials, all read-only so a sandboxed Claude cannot modify them.
+    // SSH key + known_hosts for git over ssh; gitconfig for user.name/email.
+    "source=${localEnv:HOME}/.ssh,target=/home/vscode/.ssh,type=bind,readonly",
+    "source=${localEnv:HOME}/.gitconfig,target=/home/vscode/.gitconfig,type=bind,readonly",
+    // wandb (and any other tool that uses .netrc) credentials.
+    "source=${localEnv:HOME}/.netrc,target=/home/vscode/.netrc,type=bind,readonly",
+    // GitHub CLI auth (so `gh pr create` etc. work without re-login).
+    "source=${localEnv:HOME}/.config/gh,target=/home/vscode/.config/gh,type=bind,readonly",
+    // HuggingFace cache (model downloads + token if you ever `huggingface-cli login`).
+    // NOTE: this one is read-write so the container can populate the cache on
+    // first download. If you'd rather keep it read-only, drop the cache mount
+    // and let the container build its own cache in a separate volume.
+    "source=${localEnv:HOME}/.cache/huggingface,target=/home/vscode/.cache/huggingface,type=bind,consistency=delegated"
+  ],
+  "containerEnv": {
+    "CLAUDE_CONFIG_DIR": "/home/vscode/.claude",
+    "POWERLEVEL9K_DISABLE_GITSTATUS": "true",
+    // Optional env var fallbacks: if you `export WANDB_API_KEY=...` /
+    // `export HF_TOKEN=...` / `export GH_TOKEN=...` in your host shell,
+    // those land inside the container automatically. Safe to leave even
+    // if the env vars are unset on the host — they just resolve to empty.
+    "WANDB_API_KEY": "${localEnv:WANDB_API_KEY}",
+    "HF_TOKEN": "${localEnv:HF_TOKEN}",
+    "GH_TOKEN": "${localEnv:GH_TOKEN}"
+  },
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=delegated",
+  "workspaceFolder": "/workspace",
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+  "postStartCommand": "sudo /usr/local/bin/init-firewall.sh",
+  "waitFor": "postStartCommand"
+}

@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//tmp/**)",
+      "Bash(unzip -l /home/andrew/Dev/stereo_inertial_data_collection/data/test/dataset.zarr.zip)",
+      "Bash(python:*)",
+      "Bash(/usr/bin/python3:*)",
+      "Bash(mount)",
+      "Read(//mnt/thousand-arms-data/**)",
+      "Bash(touch /mnt/thousand-arms-data/_write_test)",
+      "Bash(rm /mnt/thousand-arms-data/_write_test)",
+      "Bash(truncate -s 100G /mnt/thousand-arms-data/_sparse_test.bin)",
+      "Bash(rm /mnt/thousand-arms-data/_sparse_test.bin)",
+      "Bash(conda run:*)",
+      "Bash(nvidia-smi --query-gpu=name,memory.total,memory.used,memory.free --format=csv)",
+      "Bash(dmesg)",
+      "Bash(journalctl --since \"10 minutes ago\")",
+      "Bash(nvidia-smi:*)",
+      "Bash(gh api:*)",
+      "Bash(chmod +x /home/andrew/Dev/diffusion_policy/.devcontainer/post-create.sh)"
+    ]
+  }
+}
