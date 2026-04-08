@@ -1,4 +1,8 @@
 name: trace_image
+# Dataset shape segment, used by the workspace's output/cache paths so each
+# shape (square, square_3d, circle, ...) gets its own outputs/<task>/<shape>/
+# directory per the thousand-arms-data layout convention.
+dataset_shape: square_3d
 
 image_shape: &image_shape [3, 224, 224]
 shape_meta: &shape_meta
@@ -19,7 +23,7 @@ shape_meta: &shape_meta
   action:
     shape: [9]
 
-dataset_path: &dataset_path /mnt/thousand-arms-data/data/trace/square/dataset.zarr.zip
+dataset_path: &dataset_path /mnt/thousand-arms-data/data/trace/square_3d/dataset.zarr.zip
 
 # No simulator for this real-world task. Reuse the existing no-op runner
 # the same way UMI does in its own task/umi.yaml.
@@ -35,7 +39,7 @@ dataset:
   # raw data, keeping derived caches out of the nearly-full internal
   # NVMe. ext4 gives us proper sparse-file support so LMDB's default
   # 1 TiB map_size doesn't actually allocate any disk until written.
-  cache_dir: /mnt/thousand-arms-data/cache/trace
+  cache_dir: /mnt/thousand-arms-data/cache/trace/square_3d
   horizon: ${horizon}
   n_obs_steps: ${dataset_obs_steps}
   pad_before: ${eval:'${n_obs_steps}-1'}
