@@ -1,0 +1,27 @@
+# Measured system latencies for real-time inference.
+# Each entry: latency in seconds (use seconds in code; ms shown in comments).
+
+camera:
+  # INDEMIND stereo camera, 640x400 @ 50 Hz, left image used.
+  # Measured 2026-04-15 with latency_tests/camera_latency.py (UMI methodology).
+  # n=1103 frames, raw t_recv - t_sample_decoded, qr_overhead subtracted.
+  # Setup: Razer Blade laptop, 240 Hz QHD panel as QR display surface.
+  raw_mean_s: 0.0344        # 34.4 ms
+  qr_overhead_s: 0.0051     # 5.1 ms (script: t_show - t_sample)
+  corrected_mean_s: 0.0293  # 29.3 ms (UMI's "camera latency" definition)
+  corrected_std_s: 0.0077   # 7.7 ms
+  corrected_p50_s: 0.0290   # 29.0 ms
+  corrected_p95_s: 0.0434   # 43.4 ms
+  monitor_lag_estimate_s: 0.008  # ~5-10 ms 240 Hz panel response/refresh
+  # Use this in inference: shift camera observation timestamps back by this.
+  inference_offset_s: 0.0293 #29.3 ms
+
+robot:
+  # Piper arm end-effector execution latency (command -> actual TCP response).
+  # Measured 2026-04-15 with latency_tests/piper_latency.py.
+  # Method: 0.5 Hz sine on TCP X around base pose [0.357, 0, 0.255, 0, 85, 0],
+  # A=30 mm, cmd@30 Hz, fb@200 Hz, 10 s duration. Cross-correlated via
+  # UMI's get_latency (force_positive=True).
+  execution_latency_s: 0.082  # 82 ms
+  # Use this in inference: schedule actions this far ahead of target time.
+  inference_offset_s: 0.082
