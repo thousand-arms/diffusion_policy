@@ -5,8 +5,10 @@ random init (no checkpoint), runs predict_action on a random obs dict 100
 times, and prints mean/median wall-clock latency including host->device
 transfer and the .cpu().numpy() postprocess.
 """
+
 import sys
 import pathlib
+
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
@@ -33,14 +35,14 @@ OmegaConf.register_new_resolver("eval", eval, replace=True)
 def build_random_obs(shape_meta, n_obs_steps):
     """Return numpy obs dict (T, *shape) matching the shape_meta['obs'] spec."""
     obs = {}
-    for key, attr in shape_meta['obs'].items():
-        shape = tuple(attr['shape'])
+    for key, attr in shape_meta["obs"].items():
+        shape = tuple(attr["shape"])
         obs[key] = np.random.rand(n_obs_steps, *shape).astype(np.float32)
     return obs
 
 
 def main():
-    device = torch.device('cuda')
+    device = torch.device("cuda")
 
     # compose config (resolves `defaults: task: trace_image`)
     with initialize_config_dir(config_dir=CONFIG_DIR, version_base=None):
@@ -56,9 +58,9 @@ def main():
     # populate the normalizer with identity params — training would fit these
     # from the dataset, but for pure latency measurement identity is fine and
     # has the same compute cost as any fitted affine transform.
-    for key in cfg.task.shape_meta['obs']:
+    for key in cfg.task.shape_meta["obs"]:
         policy.normalizer[key] = SingleFieldLinearNormalizer.create_identity()
-    policy.normalizer['action'] = SingleFieldLinearNormalizer.create_identity()
+    policy.normalizer["action"] = SingleFieldLinearNormalizer.create_identity()
 
     policy.eval().to(device)
     policy.num_inference_steps = 16  # DDIM inference iterations
@@ -85,7 +87,7 @@ def main():
             # inference
             result = policy.predict_action(obs_dict)
             # post: device -> host
-            action = result['action'][0].detach().cpu().numpy()
+            action = result["action"][0].detach().cpu().numpy()
 
             torch.cuda.synchronize()
             t1 = time.perf_counter()
@@ -100,5 +102,5 @@ def main():
     print(f"  max    = {times_ms.max():.2f}")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

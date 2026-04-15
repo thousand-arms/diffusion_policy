@@ -14,10 +14,10 @@ T_ARUCO_TO_PIPER = np.array([-0.590, 0.330, 0.0])
 
 TF_WRIST_TO_CAMERA = np.array(
     [
-        [0, 0.7071, -0.7071, 0.01042],
-        [-0.7071, 0.5, 0.5, 0.18364],
-        [0.7071, 0.5, 0.5, 0.10064],
-        [0, 0, 0, 1],
+        [0.7071, 0.0, -0.7071, -0.0796],
+        [-0.5000, 0.7071, -0.5000, 0.1836],
+        [0.5000, 0.7071, 0.5000, 0.1006],
+        [0.0, 0.0, 0.0, 1.0000],
     ]
 )
 
@@ -39,12 +39,9 @@ def set_end_effector_pose(piper, pose, cam=True):
         T_base_cam = np.eye(4)
         T_base_cam[:3, :3] = R.from_euler("xyz", pose[3:6], degrees=True).as_matrix()
         T_base_cam[:3, 3] = pose[:3]
-        # T_base_wrist = TF_WRIST_TO_CAMERA @ T_base_cam
         T_base_wrist = T_base_cam @ np.linalg.inv(TF_WRIST_TO_CAMERA)
-        print(f"T_base_wrist: {T_base_wrist}")
         x, y, z = T_base_wrist[:3, 3]
         rx, ry, rz = R.from_matrix(T_base_wrist[:3, :3]).as_euler("xyz", degrees=True)
-        print(f"converted wrist pose: {[x, y, z, rx, ry, rz]}")
     else:
         x, y, z, rx, ry, rz = pose
 
@@ -110,12 +107,13 @@ def main():
     piper = setup_piper()
 
     # known-reachable wrist pose (matches arm's resting feedback: 57mm, 0, 215mm, 0, 85deg, 0)
-    target_pose = [0.357, 0.0, 0.255, 0.0, 85.0, 0.0]
-    # target_pose = [0.337, 0.0, 0.2, 0.0, 0.0, 0.0]
+    # target_pose = [0.357, 0.0, 0.255, 0.0, 85.0, 0.0]
+    # target_pose = [0.42, 0.10, 0.30, 0.0, 85.0, 0.0]
+    target_pose = [0.35, 0.11, 0.25, 0.0, 85.0, 0.0]
     start = time.time()
     while True:
-        # cam = int((time.time() - start) / 5) % 2 == 0
-        cam = True
+        cam = int((time.time() - start) / 5) % 2 == 0
+        # cam = True
         print(f"cam={cam}")
         print(piper.GetArmEndPoseMsgs())
         set_end_effector_pose(piper, target_pose, cam=cam)

@@ -66,7 +66,7 @@ policy:
   num_inference_steps: 16
   obs_as_global_cond: ${obs_as_global_cond}
   diffusion_step_embed_dim: 128
-  down_dims: [512, 1024, 2048]
+  down_dims: [256, 512, 1024]
   kernel_size: 5
   n_groups: 8
   cond_predict_scale: True

@@ -17,7 +17,8 @@
       "Bash(journalctl --since \"10 minutes ago\")",
       "Bash(nvidia-smi:*)",
       "Bash(gh api:*)",
-      "Bash(chmod +x /home/andrew/Dev/diffusion_policy/.devcontainer/post-create.sh)"
+      "Bash(chmod +x /home/andrew/Dev/diffusion_policy/.devcontainer/post-create.sh)",
+      "Bash(/home/andrew/miniconda3/envs/robodiff/bin/python latency_tests/inference.py)"
     ]
   }
 }
