@@ -69,6 +69,7 @@ def main():
     n_params = sum(p.numel() for p in policy.parameters())
     print(f"Policy parameters: {n_params/1e6:.2f} M")
     print(f"down_dims: {list(cfg.policy.down_dims)}")
+    print(f"horizon: {cfg.horizon}")
 
     # random obs on host
     cpu_obs = build_random_obs(cfg.task.shape_meta, cfg.n_obs_steps)

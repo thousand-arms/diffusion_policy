@@ -107,13 +107,14 @@ def main():
     piper = setup_piper()
 
     # known-reachable wrist pose (matches arm's resting feedback: 57mm, 0, 215mm, 0, 85deg, 0)
-    # target_pose = [0.357, 0.0, 0.255, 0.0, 85.0, 0.0]
-    # target_pose = [0.42, 0.10, 0.30, 0.0, 85.0, 0.0]
-    target_pose = [0.35, 0.11, 0.25, 0.0, 85.0, 0.0]
+    # target_pose = [0.35, 0.11, 0.25, 25.0, 85.0, 0.0]  # rx
+    target_pose = [0.35, 0.11, 0.25, 0.0, 85.0, -20.0]  # rz
+
+    # target_pose = [0.35, 0.11, 0.25, 0.0, 85.0, 0.0]  # ry
     start = time.time()
     while True:
-        cam = int((time.time() - start) / 5) % 2 == 0
-        # cam = True
+        # cam = int((time.time() - start) / 5) % 2 == 0
+        cam = True
         print(f"cam={cam}")
         print(piper.GetArmEndPoseMsgs())
         set_end_effector_pose(piper, target_pose, cam=cam)

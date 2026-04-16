@@ -190,6 +190,7 @@ class TraceDataset(BaseImageDataset):
             val_ratio: float = 0.0,
             max_train_episodes: int = None,
             image_normalization: str = 'range',
+            down_sample_steps: int = 1,
             ):
         """
         Args:
@@ -238,12 +239,23 @@ class TraceDataset(BaseImageDataset):
                 'identity' -> pass images through unchanged in [0,1]. Use
                              when the visual backbone applies its own
                              preprocessing (e.g. ImageNet-pretrained timm).
+            down_sample_steps: stride applied uniformly to every obs and
+                action key when slicing a training window out of the replay
+                buffer. Lets a policy trained at rate `f_raw / down_sample_steps`
+                reuse data collected at the higher raw rate `f_raw`. The
+                sampler is asked for a *raw* window of length
+                `(horizon - 1) * down_sample_steps + 1` and `pad_before` /
+                `pad_after` are scaled by the same factor so that the final
+                strided sample still contains exactly `horizon` frames and
+                the pad budgets stay expressed in post-stride units.
         """
         super().__init__()
         assert image_normalization in ('range', 'identity'), \
             f"image_normalization must be 'range' or 'identity', got {image_normalization!r}"
         assert 1 <= n_obs_steps <= horizon, \
             f"n_obs_steps ({n_obs_steps}) must be in [1, horizon={horizon}]"
+        assert down_sample_steps >= 1, \
+            f"down_sample_steps must be >= 1, got {down_sample_steps}"
 
         self.replay_buffer = _load_replay_buffer_via_lmdb_cache(
             zarr_path=zarr_path, cache_dir=cache_dir)
@@ -258,11 +270,15 @@ class TraceDataset(BaseImageDataset):
             max_n=max_train_episodes,
             seed=seed)
 
+        raw_sequence_length = (horizon - 1) * down_sample_steps + 1
+        raw_pad_before = pad_before * down_sample_steps
+        raw_pad_after = pad_after * down_sample_steps
+
         self.sampler = SequenceSampler(
             replay_buffer=self.replay_buffer,
-            sequence_length=horizon,
-            pad_before=pad_before,
-            pad_after=pad_after,
+            sequence_length=raw_sequence_length,
+            pad_before=raw_pad_before,
+            pad_after=raw_pad_after,
             episode_mask=train_mask)
 
         self.train_mask = train_mask
@@ -270,6 +286,10 @@ class TraceDataset(BaseImageDataset):
         self.n_obs_steps = n_obs_steps
         self.pad_before = pad_before
         self.pad_after = pad_after
+        self.raw_sequence_length = raw_sequence_length
+        self.raw_pad_before = raw_pad_before
+        self.raw_pad_after = raw_pad_after
+        self.down_sample_steps = down_sample_steps
         self.image_normalization = image_normalization
 
     # ------------------------------------------------------------------ split
@@ -278,9 +298,9 @@ class TraceDataset(BaseImageDataset):
         val_set = copy.copy(self)
         val_set.sampler = SequenceSampler(
             replay_buffer=self.replay_buffer,
-            sequence_length=self.horizon,
-            pad_before=self.pad_before,
-            pad_after=self.pad_after,
+            sequence_length=self.raw_sequence_length,
+            pad_before=self.raw_pad_before,
+            pad_after=self.raw_pad_after,
             episode_mask=~self.train_mask)
         val_set.train_mask = ~self.train_mask
         return val_set
@@ -289,6 +309,15 @@ class TraceDataset(BaseImageDataset):
 
     def __len__(self) -> int:
         return len(self.sampler)
+
+    def _sample_strided(self, idx: int) -> Dict[str, np.ndarray]:
+        """Pull a raw window from the sampler and stride every key down to
+        the policy-facing horizon. No-op when `down_sample_steps == 1`."""
+        sample = self.sampler.sample_sequence(idx)
+        if self.down_sample_steps > 1:
+            sample = {
+                k: v[::self.down_sample_steps] for k, v in sample.items()}
+        return sample
 
     def _relativize_poses(self, sample: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
         """Build homogeneous pose matrices from the sampled `cam_pos` and
@@ -357,7 +386,7 @@ class TraceDataset(BaseImageDataset):
         }
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        sample = self.sampler.sample_sequence(idx)
+        sample = self._sample_strided(idx)
         data = self._sample_to_data(sample)
         return dict_apply(data, torch.from_numpy)
 
@@ -384,7 +413,7 @@ class TraceDataset(BaseImageDataset):
         action_chunks = []
         for idx in tqdm(range(len(self.sampler)),
                         desc='fitting trace normalizer'):
-            sample = self.sampler.sample_sequence(idx)
+            sample = self._sample_strided(idx)
             rel = self._relativize_poses(sample)
             pos_chunks.append(rel['cam_pos'])
             rot_chunks.append(rel['cam_rot_6d'])
