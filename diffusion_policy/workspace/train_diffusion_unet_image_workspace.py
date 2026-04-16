@@ -29,6 +29,7 @@ from diffusion_policy.common.json_logger import JsonLogger
 from diffusion_policy.common.pytorch_util import dict_apply, optimizer_to
 from diffusion_policy.model.diffusion.ema_model import EMAModel
 from diffusion_policy.model.common.lr_scheduler import get_scheduler
+from diffusion_policy.common.wandb_viz import log_sample_visualizations
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
@@ -144,6 +145,7 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
 
         # save batch for sampling
         train_sampling_batch = None
+        val_sampling_batch = None
 
         if cfg.training.debug:
             cfg.training.num_epochs = 2
@@ -235,6 +237,8 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                                 leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
                             for batch_idx, batch in enumerate(tepoch):
                                 batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
+                                if val_sampling_batch is None:
+                                    val_sampling_batch = batch
                                 loss = self.model.compute_loss(batch)
                                 val_losses.append(loss)
                                 if (cfg.training.max_val_steps is not None) \
@@ -252,17 +256,37 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                         batch = dict_apply(train_sampling_batch, lambda x: x.to(device, non_blocking=True))
                         obs_dict = batch['obs']
                         gt_action = batch['action']
-                        
+
                         result = policy.predict_action(obs_dict)
                         pred_action = result['action_pred']
                         mse = torch.nn.functional.mse_loss(pred_action, gt_action)
                         step_log['train_action_mse_error'] = mse.item()
+
+                        # log train visualizations
+                        step_log.update(log_sample_visualizations(
+                            obs_dict, gt_action, pred_action,
+                            n_obs_steps=cfg.n_obs_steps, prefix='train'))
+
                         del batch
                         del obs_dict
                         del gt_action
                         del result
                         del pred_action
                         del mse
+
+                        # val visualizations
+                        if val_sampling_batch is not None:
+                            batch = dict_apply(val_sampling_batch, lambda x: x.to(device, non_blocking=True))
+                            obs_dict = batch['obs']
+                            gt_action = batch['action']
+                            result = policy.predict_action(obs_dict)
+                            pred_action = result['action_pred']
+                            val_mse = torch.nn.functional.mse_loss(pred_action, gt_action)
+                            step_log['val_action_mse_error'] = val_mse.item()
+                            step_log.update(log_sample_visualizations(
+                                obs_dict, gt_action, pred_action,
+                                n_obs_steps=cfg.n_obs_steps, prefix='val'))
+                            del batch, obs_dict, gt_action, result, pred_action, val_mse
                 
                 # checkpoint
                 if (self.epoch % cfg.training.checkpoint_every) == 0:
