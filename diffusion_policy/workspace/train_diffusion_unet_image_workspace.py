@@ -128,6 +128,12 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
             save_dir=os.path.join(self.output_dir, 'checkpoints'),
             **cfg.checkpoint.topk
         )
+        topk_val_manager = None
+        if cfg.checkpoint.get('topk_val', None) is not None:
+            topk_val_manager = TopKCheckpointManager(
+                save_dir=os.path.join(self.output_dir, 'checkpoints'),
+                **cfg.checkpoint.topk_val
+            )
 
         # device transfer
         device = torch.device(cfg.training.device)
@@ -276,9 +282,13 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                     # since save_checkpoint uses threads.
                     # therefore at this point the file might have been empty!
                     topk_ckpt_path = topk_manager.get_ckpt_path(metric_dict)
-
                     if topk_ckpt_path is not None:
                         self.save_checkpoint(path=topk_ckpt_path)
+
+                    if topk_val_manager is not None and 'val_loss' in metric_dict:
+                        topk_val_path = topk_val_manager.get_ckpt_path(metric_dict)
+                        if topk_val_path is not None:
+                            self.save_checkpoint(path=topk_val_path)
 
                     # Reclaim transient memory from the pickle buffers
                     # used by save_checkpoint() before the next epoch's

@@ -116,7 +116,7 @@ training:
   # optimization
   lr_scheduler: cosine
   lr_warmup_steps: 500
-  num_epochs: 300
+  num_epochs: 100
   gradient_accumulate_every: 1
   # EMA destroys performance when used with BatchNorm.
   # We keep BN intact and freeze the encoder instead (see obs_encoder note).
@@ -126,7 +126,7 @@ training:
   # rollout_every is effectively disabled since the env_runner is a no-op,
   # but we keep it high to avoid noise in wandb logs.
   rollout_every: 100000
-  checkpoint_every: 50
+  checkpoint_every: 10
   val_every: 1
   sample_every: 5
   # steps per epoch
@@ -136,7 +136,7 @@ training:
   tqdm_interval_sec: 1.0
 
 logging:
-  project: diffusion_policy_debug
+  project: diffusion_policy_trace
   resume: True
   mode: online
   name: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
@@ -151,6 +151,11 @@ checkpoint:
     mode: min
     k: 5
     format_str: 'epoch={epoch:04d}-train_loss={train_loss:.4f}.ckpt'
+  topk_val:
+    monitor_key: val_loss
+    mode: min
+    k: 5
+    format_str: 'epoch={epoch:04d}-val_loss={val_loss:.4f}.ckpt'
   save_last_ckpt: True
   save_last_snapshot: False
 

@@ -129,6 +129,12 @@ class PiperDriver:
     def get_arm_status(self):
         return self.piper.GetArmStatus().arm_status
 
+    def is_target_reachable(self) -> bool:
+        """Check if the arm accepted the last target. Returns False if
+        arm_status reports an IK/limit error (no-sol, singularity,
+        joint-limit, collision, etc.)."""
+        return self.get_arm_status().arm_status == 0
+
     def print_status(self):
         s = self.get_arm_status()
         print(
