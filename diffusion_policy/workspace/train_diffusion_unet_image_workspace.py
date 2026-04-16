@@ -147,6 +147,7 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
         train_sampling_batch = None
         val_sampling_batch = None
         val_sampling_fixed = False
+        logged_sample_images = False
 
         if cfg.training.debug:
             cfg.training.num_epochs = 2
@@ -268,10 +269,11 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                         mse = torch.nn.functional.mse_loss(pred_action, gt_action)
                         step_log['train_action_mse_error'] = mse.item()
 
-                        # log train visualizations
+                        # log train visualizations (images only on first epoch)
                         step_log.update(log_sample_visualizations(
                             obs_dict, gt_action, pred_action,
-                            n_obs_steps=cfg.n_obs_steps, prefix='train'))
+                            n_obs_steps=cfg.n_obs_steps, prefix='train',
+                            log_images=not logged_sample_images))
 
                         del batch
                         del obs_dict
@@ -291,8 +293,10 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                             step_log['val_action_mse_error'] = val_mse.item()
                             step_log.update(log_sample_visualizations(
                                 obs_dict, gt_action, pred_action,
-                                n_obs_steps=cfg.n_obs_steps, prefix='val'))
+                                n_obs_steps=cfg.n_obs_steps, prefix='val',
+                                log_images=not logged_sample_images))
                             del batch, obs_dict, gt_action, result, pred_action, val_mse
+                        logged_sample_images = True
                 
                 # checkpoint
                 if (self.epoch % cfg.training.checkpoint_every) == 0:

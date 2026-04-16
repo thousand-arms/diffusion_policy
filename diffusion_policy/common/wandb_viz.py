@@ -77,6 +77,7 @@ def log_sample_visualizations(
     n_obs_steps: int,
     prefix: str,
     n_samples: int = 5,
+    log_images: bool = True,
 ) -> dict:
     """Build wandb log dict with stereo images and trajectory plots.
 
@@ -87,6 +88,8 @@ def log_sample_visualizations(
         n_obs_steps: number of observation steps.
         prefix:      'train' or 'val'.
         n_samples:   number of batch elements to visualize.
+        log_images:  if False, skip stereo images (they don't change across
+                     epochs when the sampling batch is fixed).
 
     Returns a dict of wandb-loggable items.
     """
@@ -101,16 +104,16 @@ def log_sample_visualizations(
     traj_images = []
 
     for idx in indices:
-        cam0 = obs_dict['cam0'][idx].detach().cpu().numpy()  # (T, 3, H, W)
-        cam1 = obs_dict['cam1'][idx].detach().cpu().numpy()
         gt = gt_action[idx].detach().cpu().numpy()           # (T, 9)
         pred = pred_action[idx].detach().cpu().numpy()       # (T, 9)
 
-        # stereo image from last obs step
-        stereo = make_stereo_image(
-            cam0[n_obs_steps - 1], cam1[n_obs_steps - 1])
-        stereo_images.append(wandb.Image(
-            stereo, caption=f'{prefix} sample {idx}'))
+        if log_images:
+            cam0 = obs_dict['cam0'][idx].detach().cpu().numpy()  # (T, 3, H, W)
+            cam1 = obs_dict['cam1'][idx].detach().cpu().numpy()
+            stereo = make_stereo_image(
+                cam0[n_obs_steps - 1], cam1[n_obs_steps - 1])
+            stereo_images.append(wandb.Image(
+                stereo, caption=f'{prefix} sample {idx}'))
 
         # trajectory plot
         fig = make_trajectory_figure(
@@ -121,7 +124,8 @@ def log_sample_visualizations(
         traj_images.append(wandb.Image(fig, caption=f'{prefix} sample {idx}'))
         plt.close(fig)
 
-    log[f'{prefix}/stereo_obs'] = stereo_images
+    if log_images:
+        log[f'{prefix}/stereo_obs'] = stereo_images
     log[f'{prefix}/trajectory'] = traj_images
 
     return log
