@@ -146,6 +146,7 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
         # save batch for sampling
         train_sampling_batch = None
         val_sampling_batch = None
+        val_sampling_fixed = False
 
         if cfg.training.debug:
             cfg.training.num_epochs = 2
@@ -237,8 +238,12 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                                 leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
                             for batch_idx, batch in enumerate(tepoch):
                                 batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
-                                if val_sampling_batch is None:
-                                    val_sampling_batch = batch
+                                # Reservoir-sample a batch on the first val
+                                # pass; once chosen it stays fixed so we can
+                                # track prediction quality over epochs.
+                                if val_sampling_batch is None or not val_sampling_fixed:
+                                    if random.random() < 1.0 / (batch_idx + 1):
+                                        val_sampling_batch = batch
                                 loss = self.model.compute_loss(batch)
                                 val_losses.append(loss)
                                 if (cfg.training.max_val_steps is not None) \
@@ -248,6 +253,7 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                             val_loss = torch.mean(torch.tensor(val_losses)).item()
                             # log epoch average validation loss
                             step_log['val_loss'] = val_loss
+                        val_sampling_fixed = True
 
                 # run diffusion sampling on a training batch
                 if (self.epoch % cfg.training.sample_every) == 0:

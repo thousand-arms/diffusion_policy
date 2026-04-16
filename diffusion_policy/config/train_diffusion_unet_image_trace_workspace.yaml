@@ -116,7 +116,7 @@ training:
   # optimization
   lr_scheduler: cosine
   lr_warmup_steps: 500
-  num_epochs: 100
+  num_epochs: 300
   gradient_accumulate_every: 1
   # EMA destroys performance when used with BatchNorm.
   # We keep BN intact and freeze the encoder instead (see obs_encoder note).
@@ -126,9 +126,9 @@ training:
   # rollout_every is effectively disabled since the env_runner is a no-op,
   # but we keep it high to avoid noise in wandb logs.
   rollout_every: 100000
-  checkpoint_every: 10
+  checkpoint_every: 5
   val_every: 1
-  sample_every: 5
+  sample_every: 1
   # steps per epoch
   max_train_steps: null
   max_val_steps: null

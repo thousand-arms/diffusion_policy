@@ -76,7 +76,7 @@ def log_sample_visualizations(
     pred_action,
     n_obs_steps: int,
     prefix: str,
-    sample_idx: int = 0,
+    n_samples: int = 5,
 ) -> dict:
     """Build wandb log dict with stereo images and trajectory plots.
 
@@ -86,31 +86,42 @@ def log_sample_visualizations(
         pred_action: (B, T, 9) tensor — predicted action.
         n_obs_steps: number of observation steps.
         prefix:      'train' or 'val'.
-        sample_idx:  which batch element to visualize.
+        n_samples:   number of batch elements to visualize.
 
     Returns a dict of wandb-loggable items.
     """
     log = {}
+    batch_size = gt_action.shape[0]
+    n_samples = min(n_samples, batch_size)
 
-    # move to numpy, pick one sample
-    cam0 = obs_dict['cam0'][sample_idx].detach().cpu().numpy()  # (T, 3, H, W)
-    cam1 = obs_dict['cam1'][sample_idx].detach().cpu().numpy()
-    gt = gt_action[sample_idx].detach().cpu().numpy()           # (T, 9)
-    pred = pred_action[sample_idx].detach().cpu().numpy()       # (T, 9)
+    # Spread samples across the batch instead of always taking the first N
+    indices = np.sort(np.random.choice(batch_size, size=n_samples, replace=False))
 
-    # stereo image from last obs step
-    stereo = make_stereo_image(
-        cam0[n_obs_steps - 1], cam1[n_obs_steps - 1])
-    log[f'{prefix}/stereo_obs'] = wandb.Image(
-        stereo, caption=f'{prefix} obs (last step)')
+    stereo_images = []
+    traj_images = []
 
-    # trajectory plot
-    fig = make_trajectory_figure(
-        gt_pos=gt[:, :3],
-        pred_pos=pred[:, :3],
-        n_obs_steps=n_obs_steps,
-    )
-    log[f'{prefix}/trajectory'] = wandb.Image(fig)
-    plt.close(fig)
+    for idx in indices:
+        cam0 = obs_dict['cam0'][idx].detach().cpu().numpy()  # (T, 3, H, W)
+        cam1 = obs_dict['cam1'][idx].detach().cpu().numpy()
+        gt = gt_action[idx].detach().cpu().numpy()           # (T, 9)
+        pred = pred_action[idx].detach().cpu().numpy()       # (T, 9)
+
+        # stereo image from last obs step
+        stereo = make_stereo_image(
+            cam0[n_obs_steps - 1], cam1[n_obs_steps - 1])
+        stereo_images.append(wandb.Image(
+            stereo, caption=f'{prefix} sample {idx}'))
+
+        # trajectory plot
+        fig = make_trajectory_figure(
+            gt_pos=gt[:, :3],
+            pred_pos=pred[:, :3],
+            n_obs_steps=n_obs_steps,
+        )
+        traj_images.append(wandb.Image(fig, caption=f'{prefix} sample {idx}'))
+        plt.close(fig)
+
+    log[f'{prefix}/stereo_obs'] = stereo_images
+    log[f'{prefix}/trajectory'] = traj_images
 
     return log
