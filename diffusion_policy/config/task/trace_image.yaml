@@ -31,7 +31,7 @@ dataset_path: &dataset_path /mnt/thousand-arms-data/data/trace/square_3d/dataset
 # f_raw / down_sample_steps. Lengths like `horizon`, `n_obs_steps`, and
 # `n_action_steps` stay expressed in post-stride (policy-facing) frames;
 # the dataset scales them by this factor when requesting raw windows.
-down_sample_steps: 1
+down_sample_steps: 3
 
 # No simulator for this real-world task. Reuse the existing no-op runner
 # the same way UMI does in its own task/umi.yaml.

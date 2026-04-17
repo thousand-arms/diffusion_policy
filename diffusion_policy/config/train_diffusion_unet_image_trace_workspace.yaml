@@ -127,8 +127,7 @@ training:
   # but we keep it high to avoid noise in wandb logs.
   rollout_every: 100000
   checkpoint_every: 5
-  val_every: 1
-  sample_every: 1
+  val_every: 20
   # steps per epoch
   max_train_steps: null
   max_val_steps: null
@@ -152,10 +151,10 @@ checkpoint:
     k: 5
     format_str: 'epoch={epoch:04d}-train_loss={train_loss:.4f}.ckpt'
   topk_val:
-    monitor_key: val_loss
+    monitor_key: val_pos_mse
     mode: min
     k: 5
-    format_str: 'epoch={epoch:04d}-val_loss={val_loss:.4f}.ckpt'
+    format_str: 'epoch={epoch:04d}-val_pos_mse={val_pos_mse:.6f}.ckpt'
   save_last_ckpt: True
   save_last_snapshot: False
 

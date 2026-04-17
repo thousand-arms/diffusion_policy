@@ -156,7 +156,6 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
             cfg.training.rollout_every = 1
             cfg.training.checkpoint_every = 1
             cfg.training.val_every = 1
-            cfg.training.sample_every = 1
 
         # training loop
         log_path = os.path.join(self.output_dir, 'logs.json.txt')
@@ -231,11 +230,12 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                     # log all
                     step_log.update(runner_log)
 
-                # run validation
+                # run validation + sampling (combined)
                 if (self.epoch % cfg.training.val_every) == 0:
                     with torch.no_grad():
                         val_losses = list()
-                        with tqdm.tqdm(val_dataloader, desc=f"Validation epoch {self.epoch}", 
+                        val_pos_errors = list()
+                        with tqdm.tqdm(val_dataloader, desc=f"Validation epoch {self.epoch}",
                                 leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
                             for batch_idx, batch in enumerate(tepoch):
                                 batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
@@ -245,57 +245,57 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                                 if val_sampling_batch is None or not val_sampling_fixed:
                                     if random.random() < 1.0 / (batch_idx + 1):
                                         val_sampling_batch = batch
+
                                 loss = self.model.compute_loss(batch)
                                 val_losses.append(loss)
+
+                                # full inference on every val batch for position MSE
+                                result = policy.predict_action(batch['obs'])
+                                pred_pos = result['action_pred'][:, :, :3]
+                                gt_pos = batch['action'][:, :, :3]
+                                val_pos_errors.append(
+                                    torch.nn.functional.mse_loss(pred_pos, gt_pos))
+                                del result, pred_pos, gt_pos
+
                                 if (cfg.training.max_val_steps is not None) \
                                     and batch_idx >= (cfg.training.max_val_steps-1):
                                     break
+
                         if len(val_losses) > 0:
                             val_loss = torch.mean(torch.tensor(val_losses)).item()
-                            # log epoch average validation loss
                             step_log['val_loss'] = val_loss
+                        if len(val_pos_errors) > 0:
+                            val_pos_mse = torch.mean(torch.tensor(val_pos_errors)).item()
+                            step_log['val_pos_mse'] = val_pos_mse
                         val_sampling_fixed = True
 
-                # run diffusion sampling on a training batch
-                if (self.epoch % cfg.training.sample_every) == 0:
-                    with torch.no_grad():
-                        # sample trajectory from training set, and evaluate difference
+                        # train sampling — inference on one batch
                         batch = dict_apply(train_sampling_batch, lambda x: x.to(device, non_blocking=True))
                         obs_dict = batch['obs']
                         gt_action = batch['action']
-
                         result = policy.predict_action(obs_dict)
                         pred_action = result['action_pred']
                         mse = torch.nn.functional.mse_loss(pred_action, gt_action)
                         step_log['train_action_mse_error'] = mse.item()
-
-                        # log train visualizations (images only on first epoch)
                         step_log.update(log_sample_visualizations(
                             obs_dict, gt_action, pred_action,
                             n_obs_steps=cfg.n_obs_steps, prefix='train',
                             log_images=not logged_sample_images))
+                        del batch, obs_dict, gt_action, result, pred_action, mse
 
-                        del batch
-                        del obs_dict
-                        del gt_action
-                        del result
-                        del pred_action
-                        del mse
-
-                        # val visualizations
+                        # val visualizations from fixed sampling batch
                         if val_sampling_batch is not None:
                             batch = dict_apply(val_sampling_batch, lambda x: x.to(device, non_blocking=True))
                             obs_dict = batch['obs']
                             gt_action = batch['action']
                             result = policy.predict_action(obs_dict)
                             pred_action = result['action_pred']
-                            val_mse = torch.nn.functional.mse_loss(pred_action, gt_action)
-                            step_log['val_action_mse_error'] = val_mse.item()
                             step_log.update(log_sample_visualizations(
                                 obs_dict, gt_action, pred_action,
                                 n_obs_steps=cfg.n_obs_steps, prefix='val',
+                                n_samples=10,
                                 log_images=not logged_sample_images))
-                            del batch, obs_dict, gt_action, result, pred_action, val_mse
+                            del batch, obs_dict, gt_action, result, pred_action
                         logged_sample_images = True
                 
                 # checkpoint
@@ -319,7 +319,7 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                     if topk_ckpt_path is not None:
                         self.save_checkpoint(path=topk_ckpt_path)
 
-                    if topk_val_manager is not None and 'val_loss' in metric_dict:
+                    if topk_val_manager is not None and 'val_pos_mse' in metric_dict:
                         topk_val_path = topk_val_manager.get_ckpt_path(metric_dict)
                         if topk_val_path is not None:
                             self.save_checkpoint(path=topk_val_path)

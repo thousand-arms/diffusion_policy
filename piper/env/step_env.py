@@ -261,6 +261,17 @@ class StepEnv:
             T_rel[:3, 3] = horizon[i, :3]
             world_poses.append(anchor @ T_rel)
 
+        # debug: print anchor and first/last target camera + wrist poses
+        print(f"[debug] anchor cam pos (m): {anchor[:3, 3]}")
+        T_wrist_anchor = anchor @ np.linalg.inv(self.driver.tf_w2c)
+        print(f"[debug] anchor wrist pos (m): {T_wrist_anchor[:3, 3]}")
+        for di in [0, min(7, len(world_poses)-1), len(world_poses)-1]:
+            T_cam = world_poses[di]
+            T_wrist = T_cam @ np.linalg.inv(self.driver.tf_w2c)
+            rel_pos = horizon[di, :3]
+            print(f"[debug] step {di}: rel_pos={rel_pos*1000} mm  "
+                  f"cam_pos={T_cam[:3,3]}  wrist_pos={T_wrist[:3,3]}")
+
         # execute with safety checks
         last_pos = anchor[:3, 3]
         executed = 0

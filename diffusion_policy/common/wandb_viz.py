@@ -97,8 +97,9 @@ def log_sample_visualizations(
     batch_size = gt_action.shape[0]
     n_samples = min(n_samples, batch_size)
 
-    # Spread samples across the batch instead of always taking the first N
-    indices = np.sort(np.random.choice(batch_size, size=n_samples, replace=False))
+    # Evenly spread samples across the batch, deterministic so the same
+    # samples are shown every epoch for tracking prediction quality.
+    indices = np.linspace(0, batch_size - 1, n_samples, dtype=int)
 
     stereo_images = []
     traj_images = []
