@@ -55,7 +55,7 @@ policy:
     # Frozen pretrained ResNet -> BN running stats are load-bearing,
     # leave BN in place. Swap to use_group_norm=True only if we later
     # unfreeze the encoder (EMA corrupts BN running stats on fine-tune).
-    use_group_norm: False
+    use_group_norm: True
     # Stereo cams see different viewpoints; give each its own backbone.
     share_rgb_model: False
     imagenet_norm: True
@@ -121,13 +121,13 @@ training:
   # EMA destroys performance when used with BatchNorm.
   # We keep BN intact and freeze the encoder instead (see obs_encoder note).
   use_ema: True
-  freeze_encoder: True
+  freeze_encoder: False
   # training loop control (in epochs)
   # rollout_every is effectively disabled since the env_runner is a no-op,
   # but we keep it high to avoid noise in wandb logs.
   rollout_every: 100000
   checkpoint_every: 5
-  val_every: 20
+  val_every: 5
   # steps per epoch
   max_train_steps: null
   max_val_steps: null
