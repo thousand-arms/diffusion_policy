@@ -123,6 +123,45 @@ def main(
             action = action_pred.detach().cpu().numpy()
             print(f"[step] inference {(time.time() - t_infer)*1000:.0f} ms  action={action.shape}")
 
+            # save 3D trajectory plot before executing
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+            from diffusion_policy.common.wandb_viz import make_stereo_image
+            import os
+            plot_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'tmp', 'step_eval_plots')
+            os.makedirs(plot_dir, exist_ok=True)
+            step_count = len([f for f in os.listdir(plot_dir) if f.startswith('step_') and f.endswith('_traj.png')])
+            pos = action[:, :3] * 1000  # to mm
+            fig = plt.figure(figsize=(8, 8))
+            ax = fig.add_subplot(111, projection='3d')
+            # anchor frame: x-right, y-down, z-forward
+            ax.plot(pos[:, 0], pos[:, 2], -pos[:, 1], 's-', color='#F44336', markersize=4, linewidth=1.5, label='pred')
+            ax.scatter([0], [0], [0], marker='*', c='black', s=100, zorder=5, label='anchor')
+            ax.set_xlabel('X right (mm)')
+            ax.set_ylabel('Z forward (mm)')
+            ax.set_zlabel('up (mm)')
+            ax.set_title(f'Step {step_count} — predicted trajectory\n(anchor frame: X=right, Z=forward, up=-Y)')
+            ax.legend()
+            # equal aspect
+            max_range = max(abs(pos).max(), 1.0)
+            ax.set_xlim(-max_range, max_range)
+            ax.set_ylim(-max_range, max_range)
+            ax.set_zlim(-max_range, max_range)
+            # view from behind and slightly above the camera
+            ax.view_init(elev=25, azim=-60)
+            fig.tight_layout()
+            fig.savefig(os.path.join(plot_dir, f'step_{step_count:03d}_traj.png'), dpi=100, bbox_inches='tight')
+            plt.close(fig)
+            # also save stereo obs
+            cam0 = obs['cam0'][n_obs_steps - 1]  # (3, H, W)
+            cam1 = obs['cam1'][n_obs_steps - 1]
+            stereo = make_stereo_image(cam0, cam1)
+            plt.imsave(os.path.join(plot_dir, f'step_{step_count:03d}_stereo.png'), stereo)
+            # print trajectory summary
+            print(f"[step] pred trajectory: start=({pos[0,0]:+.1f},{pos[0,1]:+.1f},{pos[0,2]:+.1f})mm  end=({pos[-1,0]:+.1f},{pos[-1,1]:+.1f},{pos[-1,2]:+.1f})mm")
+            print(f"[step] saved plots to {plot_dir}/step_{step_count:03d}_*")
+
             executed = env.execute_actions(
                 action_pred=action,
                 anchor=anchor,
