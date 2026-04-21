@@ -1,9 +1,9 @@
 """Real-time continuous policy evaluation on the Piper + INDEMIND setup.
 
-Two-thread architecture with fixed dt tick:
-  - Inference thread: continuously runs get_obs → policy → stores prediction
-  - Main loop: fixed dt ticks, executes actions from current prediction.
-    Adopts new predictions at batch boundaries (every N actions).
+UMI-style synchronous architecture:
+  - Main thread: get_obs -> predict -> exec_actions (non-blocking queue) -> precise_wait
+  - PiperDriver interpolation thread at ~150Hz: reads pose_interp(t_now),
+    sends EndPoseCtrl (MOVE P). Trim-and-insert on new waypoints.
 
 Usage (from repo root):
     python -m piper.eval_real -c /path/to/checkpoint.ckpt
@@ -11,7 +11,6 @@ Usage (from repo root):
 
 import pathlib
 import sys
-import threading
 import time
 
 import click
@@ -24,69 +23,8 @@ sys.path.insert(0, str(ROOT))
 
 from diffusion_policy.common.precise_sleep import precise_wait
 from piper.common.checkpoint_util import load_policy
-from piper.common.pose_util import rel_action_to_world
 from piper.env.piper_driver import PiperDriver
 from piper.env.piper_env import PiperEnv, CAMERA_OBS_LATENCY_S, ROBOT_ACTION_LATENCY_S
-
-
-class _PredictionStore:
-    """Thread-safe store for the latest prediction from the inference thread."""
-
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._actions = None
-        self._timestamps = None
-        self._anchor = None
-        self._version = 0  # increments on each new prediction
-
-    def put(self, actions, timestamps, anchor):
-        with self._lock:
-            self._actions = actions
-            self._timestamps = timestamps
-            self._anchor = anchor
-            self._version += 1
-
-    def get(self):
-        """Returns (actions, timestamps, anchor, version)."""
-        with self._lock:
-            return self._actions, self._timestamps, self._anchor, self._version
-
-
-def _inference_loop(env, policy, device, dt, store, stop_event):
-    """Continuously run inference and store predictions."""
-    horizon = None
-    while not stop_event.is_set():
-        obs = env.get_obs()
-        if obs is None:
-            time.sleep(0.01)
-            continue
-
-        obs_time = obs["timestamp"][-1]
-        anchor = obs["anchor_mat"]
-
-        obs_torch = {
-            k: torch.from_numpy(v).unsqueeze(0).to(device)
-            for k, v in obs.items()
-            if k not in ("timestamp", "anchor_mat")
-        }
-
-        t0 = time.monotonic()
-        with torch.no_grad():
-            result = policy.predict_action(obs_torch)
-        actions = result["action_pred"][0].detach().cpu().numpy()
-        infer_ms = (time.monotonic() - t0) * 1000
-
-        if horizon is None:
-            horizon = len(actions)
-        timestamps = np.arange(horizon, dtype=np.float64) * dt + obs_time
-
-        store.put(actions, timestamps, anchor)
-
-        obs_lat = (time.monotonic() - obs_time) * 1000
-        print(
-            f"[infer] {infer_ms:.0f}ms  obs_lat={obs_lat:.0f}ms",
-            flush=True,
-        )
 
 
 @click.command()
@@ -94,19 +32,31 @@ def _inference_loop(env, policy, device, dt, store, stop_event):
 @click.option("--can-port", default="can0")
 @click.option("--speed-pct", default=100, help="Piper MOVE P speed percentage")
 @click.option("--dt", default=0.06, type=float, help="control dt (down_sample_steps / camera_hz)")
-@click.option("--n-exec-steps", default=3, type=int, help="actions per batch before checking for new prediction")
-@click.option("--max-duration", default=120.0, type=float, help="max seconds of policy control")
+@click.option("--steps-per-inference", default=3, type=int,
+              help="main loop advances this many dt per inference cycle")
+@click.option("--max-duration", default=120.0, type=float)
 @click.option("--max-step-m", default=0.05, type=float, help="safety: max step delta (m)")
+@click.option("--smooth-hz", default=150, type=int, help="interpolation controller rate (Hz)")
+@click.option("--max-pos-speed", default=0.5, type=float, help="interp max linear speed (m/s)")
+@click.option("--max-rot-speed", default=2.0, type=float, help="interp max angular speed (rad/s)")
+@click.option("--action-exec-latency", default=0.01, type=float,
+              help="only keep actions with target_time > now + this (s)")
 @click.option("--dry-run", is_flag=True, help="print targets without sending to robot")
+@click.option("--verbose-interp", is_flag=True, help="print interp thread stats")
 def main(
     checkpoint,
     can_port,
     speed_pct,
     dt,
-    n_exec_steps,
+    steps_per_inference,
     max_duration,
     max_step_m,
+    smooth_hz,
+    max_pos_speed,
+    max_rot_speed,
+    action_exec_latency,
     dry_run,
+    verbose_interp,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -116,13 +66,26 @@ def main(
     horizon = cfg.horizon
     print(f"[policy] n_obs_steps={n_obs_steps}  horizon={horizon}  device={device}")
     print(
-        f"[config] dt={dt*1000:.0f}ms  n_exec_steps={n_exec_steps}  "
+        f"[config] dt={dt*1000:.0f}ms  steps_per_inference={steps_per_inference}  "
+        f"cycle={steps_per_inference*dt*1000:.0f}ms  "
         f"cam_lat={CAMERA_OBS_LATENCY_S*1000:.0f}ms  "
         f"robot_lat={ROBOT_ACTION_LATENCY_S*1000:.0f}ms"
     )
+    print(
+        f"[interp] send_hz={smooth_hz}  max_pos={max_pos_speed}m/s  "
+        f"max_rot={max_rot_speed}rad/s"
+    )
 
     print("[robot] connecting Piper...")
-    driver = PiperDriver(can_port=can_port, speed_pct=speed_pct)
+    driver = PiperDriver(
+        can_port=can_port,
+        speed_pct=speed_pct,
+        smooth=not dry_run,
+        smooth_hz=smooth_hz,
+        max_pos_speed=max_pos_speed,
+        max_rot_speed=max_rot_speed,
+        verbose_interp=verbose_interp,
+    )
 
     print("[env] starting...")
     env = PiperEnv(
@@ -170,101 +133,98 @@ def main(
             cv2.destroyAllWindows()
             return
 
-    # ---- Policy control ----
-    store = _PredictionStore()
-    stop_event = threading.Event()
-    robot_lat = env.robot_action_latency
-
-    infer_thread = threading.Thread(
-        target=_inference_loop,
-        args=(env, policy, device, dt, store, stop_event),
-        daemon=True,
-    )
-    infer_thread.start()
-
-    # Wait for first prediction
-    while store.get()[0] is None:
-        time.sleep(0.01)
-
+    # ---- Policy control (UMI-style synchronous) ----
     print(f"[running] policy control active. press 'q' to stop.")
-    print(f"[timing] dt={dt*1000:.0f}ms  batch={n_exec_steps}  robot_lat={robot_lat*1000:.0f}ms")
 
     t_start = time.monotonic()
-    tick = 0
+    iter_idx = 0
+    cycle_idx = 0
     total_sent = 0
-    last_adopted_version = -1
-
-    # Current batch state
-    cur_actions = None
-    cur_timestamps = None
-    cur_anchor = None
-    cur_exec_idx = 0
-    cur_exec_count = 0
-    batch_num = 0
 
     try:
         while True:
-            t_next = t_start + (tick + 1) * dt
+            t_cycle_start = time.monotonic()
+            # Next cycle ends after steps_per_inference dts of planned motion
+            t_cycle_end = t_start + (iter_idx + steps_per_inference) * dt
 
             elapsed = time.monotonic() - t_start
             if elapsed > max_duration:
                 print(f"[done] max duration {max_duration}s reached.")
                 break
 
-            # Check if we need a new prediction (batch exhausted or no current plan)
-            need_new = (cur_actions is None) or (cur_exec_count >= n_exec_steps)
+            # --- get obs ---
+            obs = env.get_obs()
+            obs_time = obs["timestamp"][-1]
+            anchor = obs["anchor_mat"]
+            obs_lat_ms = (time.monotonic() - obs_time) * 1000
 
-            if need_new:
-                actions, timestamps, anchor, version = store.get()
-                if actions is not None and version != last_adopted_version:
-                    cur_actions = actions
-                    cur_timestamps = timestamps
-                    cur_anchor = anchor
-                    last_adopted_version = version
+            obs_torch = {
+                k: torch.from_numpy(v).unsqueeze(0).to(device)
+                for k, v in obs.items()
+                if k not in ("timestamp", "anchor_mat")
+            }
 
-                    # Find first valid action: after now + robot_latency
-                    now = time.monotonic()
-                    first_valid = int(np.searchsorted(
-                        cur_timestamps, now + robot_lat))
-                    first_valid = max(first_valid, 2)
-                    cur_exec_idx = first_valid
-                    cur_exec_count = 0
-                    batch_num += 1
+            # --- inference ---
+            t_infer = time.monotonic()
+            with torch.no_grad():
+                result = policy.predict_action(obs_torch)
+            actions = result["action_pred"][0].detach().cpu().numpy()
+            infer_ms = (time.monotonic() - t_infer) * 1000
 
-            # Execute actions for this batch
-            if cur_actions is not None and cur_exec_idx < horizon and cur_exec_count < n_exec_steps:
-                end_idx = min(cur_exec_idx + (n_exec_steps - cur_exec_count), horizon)
-                batch_actions = cur_actions[cur_exec_idx:end_idx]
-                batch_timestamps = cur_timestamps[cur_exec_idx:end_idx]
+            # --- schedule actions ---
+            action_timestamps = np.arange(horizon, dtype=np.float64) * dt + obs_time
 
-                if dry_run:
-                    for i, idx in enumerate(range(cur_exec_idx, cur_exec_idx + len(batch_actions))):
-                        pos_mm = batch_actions[i, :3] * 1000
-                        print(
-                            f"[tick {tick:3d}] b={batch_num} [{idx}] "
-                            f"pos=({pos_mm[0]:+.1f},{pos_mm[1]:+.1f},{pos_mm[2]:+.1f})mm",
-                            flush=True,
-                        )
-                else:
-                    n_sent = env.exec_actions(batch_actions, batch_timestamps, cur_anchor)
-                    total_sent += n_sent
-                    print(
-                        f"[tick {tick:3d}] b={batch_num} [{cur_exec_idx}-{cur_exec_idx + n_sent - 1}] "
-                        f"sent={n_sent}",
-                        flush=True,
-                    )
+            now = time.monotonic()
+            is_new = action_timestamps > (now + action_exec_latency)
+            new_actions = actions[is_new]
+            new_timestamps = action_timestamps[is_new]
 
-                cur_exec_idx = end_idx
-                cur_exec_count = n_exec_steps  # batch done, check for new prediction next tick
+            if len(new_actions) == 0:
+                # Over budget: inference took longer than all horizon dts.
+                # Fallback: schedule last action on next dt.
+                next_step = int(np.ceil((now - t_start) / dt))
+                fallback_t = t_start + next_step * dt
+                new_actions = actions[[-1]]
+                new_timestamps = np.array([fallback_t])
+                print(
+                    f"[over-budget] using last action at fallback t=+{fallback_t-now:.3f}s",
+                    flush=True,
+                )
 
-            # Preview (non-blocking)
+            if dry_run:
+                n_scheduled = len(new_actions)
+            else:
+                n_scheduled = env.exec_actions(
+                    new_actions, new_timestamps, anchor,
+                    compensate_latency=True, verbose=False,
+                )
+            total_sent += n_scheduled
+
+            cycle_ms = (time.monotonic() - t_cycle_start) * 1000
+            first_t_rel = new_timestamps[0] - now
+            last_t_rel = new_timestamps[-1] - now
+            arm_status_msg = driver.get_arm_status()
+            arm_status_code = getattr(arm_status_msg, "arm_status", arm_status_msg)
+            status_str = ""
+            if arm_status_code != 0:
+                status_str = f"  ARM_STATUS={int(arm_status_code):#04x}"
+            print(
+                f"[cycle {cycle_idx:3d}] infer={infer_ms:.0f}ms  "
+                f"obs_lat={obs_lat_ms:.0f}ms  "
+                f"scheduled={n_scheduled}/{len(actions)}  "
+                f"t[+{first_t_rel*1000:.0f}..+{last_t_rel*1000:.0f}]ms  "
+                f"cycle={cycle_ms:.0f}ms{status_str}",
+                flush=True,
+            )
+
+            # --- preview ---
             preview = env.get_preview()
             if preview is not None:
                 left, right = preview
                 frame = np.concatenate([left, right], axis=1)
                 cv2.putText(
                     frame,
-                    f"tick={tick} sent={total_sent} batch={batch_num} elapsed={elapsed:.1f}s",
+                    f"cycle={cycle_idx} sent={total_sent} elapsed={elapsed:.1f}s",
                     (10, 20),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.5,
@@ -276,16 +236,19 @@ def main(
             if key in (ord("q"), 27):
                 break
 
-            precise_wait(t_next)
-            tick += 1
+            # Wait for this cycle's planned motion to roughly complete.
+            # Use a small frame_latency so we grab fresh obs instead of the
+            # one from the exact cycle boundary.
+            frame_latency = 1.0 / 60.0
+            precise_wait(t_cycle_end - frame_latency)
+            iter_idx += steps_per_inference
+            cycle_idx += 1
 
     finally:
-        stop_event.set()
-        infer_thread.join(timeout=2.0)
         env.stop()
         cv2.destroyAllWindows()
         elapsed = time.monotonic() - t_start
-        print(f"[done] {tick} ticks, {total_sent} actions sent in {elapsed:.1f}s.")
+        print(f"[done] {cycle_idx} cycles, {total_sent} actions sent in {elapsed:.1f}s.")
 
 
 if __name__ == "__main__":

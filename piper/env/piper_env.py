@@ -1,14 +1,17 @@
 """Real-time continuous control environment for the Piper + INDEMIND setup.
 
-Two-thread architecture designed for use with a separate inference thread:
-  - Camera/obs buffer thread: captures frames at 50Hz in the background
-  - Main thread calls get_obs() and send_action() at a fixed tick rate
+Thread architecture:
+  - Camera/obs buffer thread: captures stereo frames at 50Hz in background.
+  - Piper interpolation thread (inside PiperDriver): sends smooth poses at ~150Hz.
+  - Main thread: calls get_obs() and exec_actions() — exec_actions is now
+    non-blocking (queues waypoints into the interpolator).
 
 Usage:
+    driver = PiperDriver(smooth=True, smooth_hz=150, max_pos_speed=0.5, max_rot_speed=2.0)
     env = PiperEnv(driver, n_obs_steps=2, dt=0.06)
     env.start()
-    obs = env.get_obs()          # dict with timestamps
-    env.send_action(action, anchor)  # single waypoint
+    obs = env.get_obs()
+    env.exec_actions(actions, timestamps, anchor)   # non-blocking
     env.stop()
 """
 
@@ -34,10 +37,6 @@ ROBOT_ACTION_LATENCY_S = 0.082  # 82ms — command sent to arm reaching target
 class _TimestampedObsBuffer:
     """Background thread that continuously captures stereo frames from INDEMIND
     and pairs each with the current Piper camera pose and a monotonic timestamp.
-
-    Timestamps are adjusted for camera latency: receive_time is shifted back
-    by CAMERA_OBS_LATENCY_S so it approximates when the image was captured,
-    not when it arrived.
     """
 
     def __init__(
@@ -64,15 +63,12 @@ class _TimestampedObsBuffer:
         self._thread.start()
 
     def _loop(self):
-        # consider adding ring buffer to timestamp everything. camera frames are actually from the past, where as pose is more current.
         while not self._stop.is_set():
             frame = self.cam.get_frame(timeout_s=0.1)
             if frame is None:
                 continue
             ts, left, right = frame
             pos, rotvec, _ = self.driver.get_camera_pose()
-            # Shift receive_time back by camera latency to approximate
-            # when the image was actually captured, not when it arrived.
             capture_time = time.monotonic() - self.camera_obs_latency
             with self._lock:
                 self.buf.append(
@@ -86,15 +82,7 @@ class _TimestampedObsBuffer:
                     }
                 )
 
-    def get_latest(self, n: int):
-        """Return the last n entries, or None if not enough data."""
-        with self._lock:
-            if len(self.buf) < n:
-                return None
-            return list(self.buf)[-n:]
-
     def get_all(self):
-        """Return all buffered entries."""
         with self._lock:
             return list(self.buf)
 
@@ -112,11 +100,7 @@ class _TimestampedObsBuffer:
 
 
 class PiperEnv:
-    """Real-time continuous control environment for Piper + INDEMIND.
-
-    Provides get_obs() for timestamped observations and send_action() for
-    commanding the robot one waypoint at a time.
-    """
+    """Real-time continuous control environment for Piper + INDEMIND."""
 
     def __init__(
         self,
@@ -148,6 +132,7 @@ class PiperEnv:
 
     def stop(self):
         self._obs_buf.stop()
+        self.driver.stop()
 
     def __enter__(self):
         self.start()
@@ -159,31 +144,15 @@ class PiperEnv:
     # ------------------------------------------------------------------- obs
 
     def get_obs(self) -> Optional[dict]:
-        """Get the latest observation with timestamps.
-
-        Selects n_obs_steps frames from the buffer spaced at self.dt apart.
-        Relativizes poses to the anchor (last obs step).
-
-        Returns dict with keys:
-            cam0:       (n_obs_steps, 3, H, W) float32 [0,1]
-            cam1:       (n_obs_steps, 3, H, W) float32 [0,1]
-            cam_pos:    (n_obs_steps, 3) float32 relativized
-            cam_rot_6d: (n_obs_steps, 6) float32 relativized
-            timestamp:  (n_obs_steps,) float64 monotonic receive times
-            anchor_mat: (4, 4) float64 world-frame pose of last obs step
-        Or None if the buffer isn't ready.
-        """
-        # Need enough frames to span (n_obs_steps - 1) * dt
+        """Get the latest observation with timestamps."""
         min_frames = max(self.n_obs_steps, 4)
         buf = self._obs_buf.get_all()
         if len(buf) < min_frames:
             return None
 
-        # Select frames with proper dt spacing
         latest = buf[-1]
         latest_t = latest["receive_time"]
 
-        # Target timestamps going backwards: [latest - (n-1)*dt, ..., latest]
         target_times = [
             latest_t - i * self.dt for i in range(self.n_obs_steps - 1, -1, -1)
         ]
@@ -196,7 +165,6 @@ class PiperEnv:
             )
             selected.append(buf[best_idx])
 
-        # Build observation arrays
         cam0 = np.stack(
             [preprocess_image(s["cam0"], self.obs_image_size) for s in selected]
         )
@@ -222,87 +190,59 @@ class PiperEnv:
 
     # ---------------------------------------------------------------- action
 
-    def send_action(self, action_9d: np.ndarray, anchor_mat: np.ndarray) -> bool:
-        """Send a single waypoint to the robot (bypasses interpolation).
-
-        Args:
-            action_9d:  (9,) relative action in anchor frame (pos3 + rot6d6).
-            anchor_mat: (4, 4) world-frame anchor pose from get_obs().
-
-        Returns True if sent, False if safety-skipped.
-        """
-        T_world = rel_action_to_world(action_9d, anchor_mat)
-
-        # Safety: check delta from current camera position
-        current_pos = self.driver.get_camera_pose_mat()[:3, 3]
-        target_pos = T_world[:3, 3]
-        delta = np.linalg.norm(target_pos - current_pos)
-        if delta > self.max_step_m:
-            print(
-                f"[safety] skipped: delta={delta*1000:.1f}mm "
-                f"> max_step_m={self.max_step_m*1000:.1f}mm"
-            )
-            return False
-
-        self.driver.set_camera_pose_mat(T_world)
-        return True
-
     def exec_actions(
         self,
         actions: np.ndarray,
         timestamps: np.ndarray,
         anchor_mat: np.ndarray,
+        compensate_latency: bool = True,
+        verbose: bool = False,
     ) -> int:
-        """Execute a batch of actions, sending each waypoint at its scheduled time.
-
-        Converts relative actions to world-frame camera poses. If the driver
-        has smooth=True, sends to the interpolation controller. Otherwise,
-        sends waypoints directly with precise_wait timing.
+        """Non-blocking: queue camera-frame waypoints into the interp thread.
 
         Args:
-            actions:    (N, 9) relative actions in anchor frame (pos3 + rot6d6).
-            timestamps: (N,) monotonic timestamps for each action.
-            anchor_mat: (4, 4) world-frame anchor pose from get_obs().
+            actions:    (N, 9) relative actions (pos3 + rot6d6).
+            timestamps: (N,) monotonic timestamps — when to arrive.
+            anchor_mat: (4, 4) world-frame anchor pose.
+            compensate_latency: subtract robot_action_latency from target_time
+                so the arm physically arrives at timestamp[i].
 
-        Returns the number of waypoints sent.
+        Returns number of waypoints scheduled (post safety filter).
         """
-        from diffusion_policy.common.precise_sleep import precise_wait
+        if self.driver._interp_ctrl is None:
+            raise RuntimeError(
+                "PiperEnv.exec_actions requires driver smooth=True")
 
-        # Convert all actions to world-frame poses, stopping at first unsafe
-        poses = []
-        valid_times = []
         current_pos = self.driver.get_camera_pose_mat()[:3, 3]
+        n_sent = 0
+        n_skipped_far = 0
 
+        r_latency = self.robot_action_latency if compensate_latency else 0.0
+
+        max_delta = 0.0
         for i in range(len(actions)):
             T_world = rel_action_to_world(actions[i], anchor_mat)
             target_pos = T_world[:3, 3]
             delta = np.linalg.norm(target_pos - current_pos)
+            max_delta = max(max_delta, delta)
             if delta > self.max_step_m:
+                n_skipped_far += 1
+                # don't break — later actions in horizon may be fine,
+                # but conservatively stop to avoid teleport across obstacles
                 break
-            poses.append(T_world)
-            valid_times.append(timestamps[i])
+            target_time = float(timestamps[i]) - r_latency
+            self.driver.schedule_waypoint(T_world, target_time)
+            n_sent += 1
 
-        if len(poses) == 0:
-            return 0
-
-        if self.driver.smooth and self.driver._interp_ctrl is not None:
-            # Smooth mode: send to interpolation controller
-            self.driver.schedule_waypoints(
-                times=np.array(valid_times),
-                poses_4x4=poses,
+        if verbose:
+            print(
+                f"[exec_actions] scheduled {n_sent}/{len(actions)}  "
+                f"max_delta={max_delta*1000:.1f}mm  skipped_far={n_skipped_far}",
+                flush=True,
             )
-        else:
-            # Direct mode: send each waypoint at its scheduled time
-            for i, (T_world, ts) in enumerate(zip(poses, valid_times)):
-                self.driver.set_camera_pose_mat(T_world)
-                # Wait until next waypoint's time (except after last)
-                if i < len(poses) - 1:
-                    precise_wait(valid_times[i + 1])
-
-        return len(poses)
+        return n_sent
 
     # --------------------------------------------------------------- preview
 
     def get_preview(self) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-        """Latest raw stereo pair for display, or None."""
         return self._obs_buf.latest_preview()
