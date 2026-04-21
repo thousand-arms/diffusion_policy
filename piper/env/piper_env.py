@@ -223,7 +223,7 @@ class PiperEnv:
     # ---------------------------------------------------------------- action
 
     def send_action(self, action_9d: np.ndarray, anchor_mat: np.ndarray) -> bool:
-        """Send a single waypoint to the robot.
+        """Send a single waypoint to the robot (bypasses interpolation).
 
         Args:
             action_9d:  (9,) relative action in anchor frame (pos3 + rot6d6).
@@ -246,6 +246,60 @@ class PiperEnv:
 
         self.driver.set_camera_pose_mat(T_world)
         return True
+
+    def exec_actions(
+        self,
+        actions: np.ndarray,
+        timestamps: np.ndarray,
+        anchor_mat: np.ndarray,
+    ) -> int:
+        """Execute a batch of actions, sending each waypoint at its scheduled time.
+
+        Converts relative actions to world-frame camera poses. If the driver
+        has smooth=True, sends to the interpolation controller. Otherwise,
+        sends waypoints directly with precise_wait timing.
+
+        Args:
+            actions:    (N, 9) relative actions in anchor frame (pos3 + rot6d6).
+            timestamps: (N,) monotonic timestamps for each action.
+            anchor_mat: (4, 4) world-frame anchor pose from get_obs().
+
+        Returns the number of waypoints sent.
+        """
+        from diffusion_policy.common.precise_sleep import precise_wait
+
+        # Convert all actions to world-frame poses, stopping at first unsafe
+        poses = []
+        valid_times = []
+        current_pos = self.driver.get_camera_pose_mat()[:3, 3]
+
+        for i in range(len(actions)):
+            T_world = rel_action_to_world(actions[i], anchor_mat)
+            target_pos = T_world[:3, 3]
+            delta = np.linalg.norm(target_pos - current_pos)
+            if delta > self.max_step_m:
+                break
+            poses.append(T_world)
+            valid_times.append(timestamps[i])
+
+        if len(poses) == 0:
+            return 0
+
+        if self.driver.smooth and self.driver._interp_ctrl is not None:
+            # Smooth mode: send to interpolation controller
+            self.driver.schedule_waypoints(
+                times=np.array(valid_times),
+                poses_4x4=poses,
+            )
+        else:
+            # Direct mode: send each waypoint at its scheduled time
+            for i, (T_world, ts) in enumerate(zip(poses, valid_times)):
+                self.driver.set_camera_pose_mat(T_world)
+                # Wait until next waypoint's time (except after last)
+                if i < len(poses) - 1:
+                    precise_wait(valid_times[i + 1])
+
+        return len(poses)
 
     # --------------------------------------------------------------- preview
 

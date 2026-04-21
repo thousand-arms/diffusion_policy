@@ -6,6 +6,7 @@ commands/feedback, handling:
   - TF_WRIST_TO_CAMERA rigid transform
   - SDK unit scaling (0.001 mm / 0.001 deg)
   - Extrinsic XYZ euler convention
+  - Optional trajectory interpolation for smooth motion
 
 Usage:
     driver = PiperDriver()
@@ -13,10 +14,12 @@ Usage:
     driver.set_camera_pose(pos, rotvec)
 """
 
+import threading
 import time
 
 import numpy as np
-from scipy.spatial.transform import Rotation as R
+from scipy.interpolate import interp1d
+from scipy.spatial.transform import Rotation as R, Slerp
 
 from piper_sdk import C_PiperInterface_V2
 
@@ -27,8 +30,15 @@ _M_TO_POS = 1_000_000  # m -> 0.001 mm (command)
 _DEG_TO_ROT = 1_000  # deg -> 0.001 deg (command)
 
 TF_WRIST_TO_CAMERA = np.array(
+    # Previous TF (before re-calibration):
+    # [
+    #     [-0.0000000, 0.7071068, -0.7071068, 0.01042],
+    #     [-0.7071068, -0.5000000, -0.5000000, 0.18364],
+    #     [-0.7071068, 0.5000000, 0.5000000, 0.10064],
+    #     [0, 0, 0, 1],
+    # ]
     [
-        [-0.0000000, 0.7071068, -0.7071068, 0.01042],
+        [-0.0000000, 0.7071068, -0.7071068, -0.07958],
         [-0.7071068, -0.5000000, -0.5000000, 0.18364],
         [-0.7071068, 0.5000000, 0.5000000, 0.10064],
         [0, 0, 0, 1],
@@ -36,14 +46,137 @@ TF_WRIST_TO_CAMERA = np.array(
 )
 
 
+class _TrajectoryInterpolator:
+    """Piecewise-linear position + SLERP rotation interpolator.
+
+    Accepts waypoints as (timestamp, T_cam_4x4) pairs. Interpolates
+    the camera pose at any query time within the waypoint range.
+    """
+
+    def __init__(self, times, poses_4x4):
+        """
+        Args:
+            times: (N,) monotonic timestamps.
+            poses_4x4: (N, 4, 4) camera poses in world frame.
+        """
+        self.times = np.array(times, dtype=np.float64)
+        positions = np.array([p[:3, 3] for p in poses_4x4])
+        rotations = R.from_matrix([p[:3, :3] for p in poses_4x4])
+
+        self._pos_interp = interp1d(
+            self.times, positions, axis=0,
+            kind="linear", fill_value="extrapolate",
+        )
+        self._rot_slerp = Slerp(self.times, rotations)
+
+    @property
+    def t_start(self):
+        return self.times[0]
+
+    @property
+    def t_end(self):
+        return self.times[-1]
+
+    def __call__(self, t):
+        """Interpolate pose at time t. Returns (4, 4) camera pose."""
+        # Clamp to valid range
+        t_clamped = np.clip(t, self.times[0], self.times[-1])
+        pos = self._pos_interp(t_clamped)
+        rot = self._rot_slerp(t_clamped)
+        T = np.eye(4)
+        T[:3, :3] = rot.as_matrix()
+        T[:3, 3] = pos
+        return T
+
+
+class _InterpolationController(threading.Thread):
+    """Background thread that interpolates between waypoints and sends
+    smooth commands to the Piper at a fixed high frequency.
+
+    New waypoints are appended to the existing trajectory (not replaced),
+    so the interpolation is continuous across prediction boundaries.
+    """
+
+    def __init__(self, driver, send_hz=50):
+        super().__init__(daemon=True)
+        self._driver = driver
+        self._dt = 1.0 / send_hz
+        self._lock = threading.Lock()
+        self._times = []      # accumulated timestamps
+        self._poses = []      # accumulated 4x4 poses
+        self._interp = None
+        self._stop = threading.Event()
+
+    def schedule_waypoints(self, times, poses_4x4):
+        """Append new waypoints to the trajectory.
+
+        Only appends waypoints whose timestamp is after the current
+        trajectory end to maintain monotonicity. Trims old waypoints
+        that are more than 1s in the past.
+
+        Args:
+            times: (N,) monotonic timestamps.
+            poses_4x4: list/array of (4, 4) world-frame camera poses.
+        """
+        now = time.monotonic()
+        with self._lock:
+            # Trim old waypoints (keep last 1s for interpolation context)
+            cutoff = now - 1.0
+            while self._times and self._times[0] < cutoff:
+                self._times.pop(0)
+                self._poses.pop(0)
+
+            # Find the last timestamp in current trajectory
+            last_t = self._times[-1] if self._times else -float("inf")
+
+            # Append only new waypoints (after current trajectory end)
+            for i in range(len(times)):
+                if times[i] > last_t:
+                    self._times.append(float(times[i]))
+                    self._poses.append(np.array(poses_4x4[i], dtype=np.float64))
+
+            # Rebuild interpolator if we have at least 2 points
+            if len(self._times) >= 2:
+                self._interp = _TrajectoryInterpolator(
+                    self._times, self._poses)
+            elif len(self._times) == 1:
+                # Single point — hold position
+                self._interp = None
+
+    def run(self):
+        next_t = time.monotonic()
+        while not self._stop.is_set():
+            now = time.monotonic()
+
+            with self._lock:
+                interp = self._interp
+
+            if interp is not None:
+                T_cam = interp(now)
+                self._driver._set_camera_pose_mat_raw(T_cam)
+
+            next_t += self._dt
+            sleep = next_t - time.monotonic()
+            if sleep > 0:
+                time.sleep(sleep)
+            else:
+                next_t = time.monotonic()
+
+    def stop(self):
+        self._stop.set()
+
+
 class PiperDriver:
     def __init__(
         self,
         can_port: str = "can0",
-        speed_pct: int = 50,
+        speed_pct: int = 100,
         tf_wrist_to_camera: np.ndarray = TF_WRIST_TO_CAMERA,
+        smooth: bool = False,
+        smooth_hz: int = 50,
     ):
         self.speed_pct = speed_pct
+        self.smooth = smooth
         self.tf_w2c = np.array(tf_wrist_to_camera, dtype=np.float64)
         self.tf_c2w = np.linalg.inv(self.tf_w2c)
 
@@ -53,6 +186,12 @@ class PiperDriver:
             time.sleep(0.01)
         self.piper.GripperCtrl(0, 1000, 0x01, 0)
         self.piper.MotionCtrl_2(0x01, 0x00, self.speed_pct, 0x00)
+
+        # Interpolation controller (started lazily on first schedule_waypoints)
+        self._interp_ctrl = None
+        if smooth:
+            self._interp_ctrl = _InterpolationController(self, send_hz=smooth_hz)
+            self._interp_ctrl.start()
 
     # ------------------------------------------------------------------ read
 
@@ -88,8 +227,29 @@ class PiperDriver:
 
     # ----------------------------------------------------------------- write
 
+    def schedule_waypoints(self, times, poses_4x4):
+        """Schedule a batch of future camera-frame waypoints for smooth execution.
+
+        Only available when smooth=True. The interpolation controller will
+        smoothly interpolate between them at high frequency.
+
+        Args:
+            times: (N,) monotonic timestamps for each waypoint.
+            poses_4x4: list of (4, 4) world-frame camera poses.
+        """
+        if self._interp_ctrl is None:
+            raise RuntimeError("schedule_waypoints requires smooth=True")
+        self._interp_ctrl.schedule_waypoints(times, poses_4x4)
+
     def set_camera_pose_mat(self, T_base_cam: np.ndarray):
-        """Command the arm so the camera arrives at T_base_cam."""
+        """Command the arm so the camera arrives at T_base_cam.
+
+        Sends directly (bypasses interpolation controller).
+        """
+        self._set_camera_pose_mat_raw(T_base_cam)
+
+    def _set_camera_pose_mat_raw(self, T_base_cam: np.ndarray):
+        """Internal: convert camera pose to wrist and send via CAN."""
         T_base_wrist = T_base_cam @ self.tf_c2w
         self._send_wrist_pose(T_base_wrist)
 
@@ -145,11 +305,6 @@ class PiperDriver:
 
 
 if __name__ == "__main__":
-    driver = PiperDriver(speed_pct=30)
-    # pos, rotvec, T = driver.get_camera_pose()
-    # euler_deg = R.from_rotvec(rotvec).as_euler("xyz", degrees=True)
-    # print(f"Camera pos (m):     {pos}")
-    # print(f"Camera euler (deg): {euler_deg}")
-    # print(f"Camera T:\n{T}")
+    driver = PiperDriver(speed_pct=30, smooth=False)
     driver.set_camera_pose_euler([0.35, 0.11, 0.25], [0.0, 0.0, 0.0])
     driver.print_status()
