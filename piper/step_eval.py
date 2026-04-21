@@ -13,40 +13,15 @@ import time
 
 import click
 import cv2
-import dill
-import hydra
 import numpy as np
 import torch
-from omegaconf import OmegaConf
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from diffusion_policy.policy.base_image_policy import BaseImagePolicy
-from diffusion_policy.workspace.base_workspace import BaseWorkspace
+from piper.common.checkpoint_util import load_policy
 from piper.env.piper_driver import PiperDriver
 from piper.env.step_env import StepEnv
-
-OmegaConf.register_new_resolver("eval", eval, replace=True)
-
-
-def load_policy(checkpoint: str, device: torch.device):
-    payload = torch.load(open(checkpoint, "rb"), pickle_module=dill, map_location="cpu")
-    cfg = payload["cfg"]
-    OmegaConf.resolve(cfg)
-
-    cls = hydra.utils.get_class(cfg._target_)
-    workspace = cls(cfg)
-    workspace.load_payload(payload)
-
-    policy: BaseImagePolicy = workspace.model
-    if getattr(cfg.training, "use_ema", False) and getattr(
-        workspace, "ema_model", None
-    ):
-        policy = workspace.ema_model
-
-    policy.eval().to(device)
-    return policy, cfg
 
 
 @click.command()

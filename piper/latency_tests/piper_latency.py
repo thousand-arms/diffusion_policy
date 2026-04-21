@@ -1,18 +1,13 @@
 """Measure Piper end-effector execution latency.
 
-Sends a sine wave on the X axis of TCP pose (UMI uses spacemouse teleop;
-a clean sine has a sharper correlation peak). Logs both the commanded
-trajectory and the actual feedback. Cross-correlates the two signals to
-recover lag = execution latency. Methodology follows UMI's
-calibrate_robot_latency.py + latency_util.get_latency.
+Sends a sine wave on the X axis of the camera TCP pose. Logs both the
+commanded trajectory and the actual feedback. Cross-correlates to recover
+the execution latency.
 
-Architecture:
-  - Main thread: command loop at COMMAND_HZ, sends EndPoseCtrl with
-    X = X_base + A * sin(2*pi*f*t)
-  - Worker thread: feedback loop at FEEDBACK_HZ, polls GetArmEndPoseMsgs
-
-After the run, both buffers are passed to get_latency(). A 3-panel plot
-is saved (cross-correlation curve, raw signals, aligned signals).
+Usage:
+    1. Manually move the arm to a safe position
+    2. Run: python piper/latency_tests/piper_latency.py
+    The script uses the current arm position as the base pose.
 """
 
 import sys
@@ -20,96 +15,95 @@ import threading
 import time
 from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from piper_replay_trajectory import set_end_effector_pose, setup_piper
+ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(ROOT))
+
+from piper.env.piper_driver import PiperDriver
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from latency_util import get_latency
 
-
-# Base pose [x(m), y(m), z(m), rx(deg), ry(deg), rz(deg)] -- known reachable.
-# Z=0.255 m + RY=85deg keeps the wrist-mounted camera holder clear of the
-# table. Sine sweeps X around this center; Z stays fixed.
-BASE_POSE = [0.357, 0.0, 0.255, 0.0, 85.0, 0.0]
-
-# Sine stimulus on X axis
-AMPLITUDE_M = 0.03
-FREQUENCY_HZ = 0.5
-
-# Loop rates
-COMMAND_HZ = 30
-FEEDBACK_HZ = 200
+# Sine stimulus on camera X axis
+AMPLITUDE_M = 0.03       # 30mm
+FREQUENCY_HZ = 0.5       # slow enough for the arm to track
+COMMAND_HZ = 30           # command send rate
+FEEDBACK_HZ = 200         # feedback poll rate
 DURATION_S = 10.0
-SETTLE_S = 2.0  # let arm reach base pose before sweeping
+SETTLE_S = 2.0            # settle time before sweeping
+SPEED_PCT = 100
 
 PLOT_PATH = Path(__file__).resolve().parent / "piper_latency_plot.png"
 
 
 class FeedbackWorker(threading.Thread):
-    def __init__(self, piper, hz):
+    """Poll camera-frame X position at high rate."""
+
+    def __init__(self, driver: PiperDriver, hz: int):
         super().__init__(daemon=True)
-        self.piper = piper
+        self.driver = driver
         self.dt = 1.0 / hz
         self.stop_event = threading.Event()
         self.t = []
-        self.x = []  # X axis in meters
+        self.x = []  # camera X in meters
 
     def run(self):
-        import traceback
-        try:
-            next_t = time.time()
-            while not self.stop_event.is_set():
-                msg = self.piper.GetArmEndPoseMsgs()
-                if msg is None:
-                    continue
-                # Piper SDK wraps the pose in .end_pose on some versions;
-                # fall back to attribute access on the top-level msg.
-                pose = getattr(msg, "end_pose", msg)
-                now = time.time()
-                self.x.append(pose.X_axis * 1e-6)  # 0.001 mm -> m
-                self.t.append(now)
-                next_t += self.dt
-                sleep = next_t - time.time()
-                if sleep > 0:
-                    time.sleep(sleep)
-                else:
-                    next_t = time.time()
-        except Exception:
-            traceback.print_exc()
+        next_t = time.time()
+        while not self.stop_event.is_set():
+            pos = self.driver.get_camera_pose_mat()[:3, 3]
+            now = time.time()
+            self.x.append(pos[0])  # camera X
+            self.t.append(now)
+            next_t += self.dt
+            sleep = next_t - time.time()
+            if sleep > 0:
+                time.sleep(sleep)
+            else:
+                next_t = time.time()
 
 
 def main():
-    piper = setup_piper()
+    print(f"[init] Connecting Piper (speed_pct={SPEED_PCT})...")
+    driver = PiperDriver(can_port="can0", speed_pct=SPEED_PCT)
+    time.sleep(0.5)
 
-    print(f"Moving to base pose {BASE_POSE} ...")
-    set_end_effector_pose(piper, BASE_POSE, cam=False)
+    # Read current camera pose as base
+    base_T = driver.get_camera_pose_mat().copy()
+    base_pos = base_T[:3, 3]
+    print(f"[init] Current camera pos (m): x={base_pos[0]:.4f} y={base_pos[1]:.4f} z={base_pos[2]:.4f}")
+    print(f"[init] Sine sweep on camera X: A={AMPLITUDE_M*1000:.0f}mm  f={FREQUENCY_HZ}Hz")
+    print(f"[init] Settling for {SETTLE_S}s...")
     time.sleep(SETTLE_S)
 
-    fb = FeedbackWorker(piper, FEEDBACK_HZ)
+    # Start feedback polling
+    fb = FeedbackWorker(driver, FEEDBACK_HZ)
     fb.start()
 
+    # Command loop: sine on camera X
     cmd_t, cmd_x = [], []
-    print(
-        f"Sweep: A={AMPLITUDE_M * 1000:.0f}mm  f={FREQUENCY_HZ}Hz  "
-        f"dur={DURATION_S}s  cmd@{COMMAND_HZ}Hz  fb@{FEEDBACK_HZ}Hz"
-    )
-
     cmd_dt = 1.0 / COMMAND_HZ
     t0 = time.time()
     next_cmd = t0
+
+    print(f"[sweep] Running for {DURATION_S}s at cmd@{COMMAND_HZ}Hz fb@{FEEDBACK_HZ}Hz...")
     while True:
         now = time.time()
         elapsed = now - t0
         if elapsed > DURATION_S:
             break
-        x = BASE_POSE[0] + AMPLITUDE_M * np.sin(2 * np.pi * FREQUENCY_HZ * elapsed)
-        pose = [x, *BASE_POSE[1:]]
-        set_end_effector_pose(piper, pose, cam=False)
+
+        x_offset = AMPLITUDE_M * np.sin(2 * np.pi * FREQUENCY_HZ * elapsed)
+        target_T = base_T.copy()
+        target_T[0, 3] = base_pos[0] + x_offset  # only modify camera X position
+
+        driver.set_camera_pose_mat(target_T)
         cmd_t.append(now)
-        cmd_x.append(x)
+        cmd_x.append(base_pos[0] + x_offset)
+
         next_cmd += cmd_dt
         sleep = next_cmd - time.time()
         if sleep > 0:
@@ -117,7 +111,8 @@ def main():
         else:
             next_cmd = time.time()
 
-    set_end_effector_pose(piper, BASE_POSE, cam=False)
+    # Return to base and stop
+    driver.set_camera_pose_mat(base_T)
     fb.stop_event.set()
     fb.join(timeout=1.0)
 
@@ -125,46 +120,53 @@ def main():
     cmd_x = np.array(cmd_x)
     fb_t = np.array(fb.t)
     fb_x = np.array(fb.x)
-    print(f"Logged: {len(cmd_t)} commands, {len(fb_t)} feedback samples")
+    print(f"[data] {len(cmd_t)} commands, {len(fb_t)} feedback samples")
 
-    latency, info = get_latency(cmd_x, cmd_t, fb_x, fb_t, force_positive=True)
-    print(f"\nPiper execution latency: {latency * 1000:.1f} ms")
+    # Trim first 2 seconds (warm-up: arm may not yet be tracking smoothly)
+    trim_s = 2.0
+    cmd_mask = cmd_t >= (cmd_t[0] + trim_s)
+    fb_mask = fb_t >= (fb_t[0] + trim_s)
+    cmd_t_trim = cmd_t[cmd_mask]
+    cmd_x_trim = cmd_x[cmd_mask]
+    fb_t_trim = fb_t[fb_mask]
+    fb_x_trim = fb_x[fb_mask]
+    print(f"[data] After {trim_s}s trim: {len(cmd_t_trim)} commands, {len(fb_t_trim)} feedback")
 
+    # Cross-correlation
+    latency, info = get_latency(cmd_x_trim, cmd_t_trim, fb_x_trim, fb_t_trim, force_positive=True)
+    print(f"\n>>> Round-trip latency (cmd→fb): {latency * 1000:.1f} ms <<<")
+    print(f"    (This includes CAN feedback delay. One-way execution"
+          f" latency is likely ~{latency * 1000 - 10:.0f}-{latency * 1000 - 5:.0f} ms)")
+
+    # Plot
     fig, axes = plt.subplots(1, 3, figsize=(15, 4))
 
     axes[0].plot(info["lags"] * 1000, info["correlation"])
-    axes[0].axvline(
-        latency * 1000,
-        color="r",
-        linestyle="--",
-        label=f"{latency * 1000:.1f} ms",
-    )
+    axes[0].axvline(latency * 1000, color="r", linestyle="--",
+                    label=f"{latency * 1000:.1f} ms")
     axes[0].set_xlabel("lag (ms)")
     axes[0].set_ylabel("correlation")
     axes[0].set_title("Cross-correlation")
     axes[0].legend()
 
-    axes[1].plot(cmd_t - cmd_t[0], cmd_x, label="commanded")
-    axes[1].plot(fb_t - cmd_t[0], fb_x, label="actual")
+    axes[1].plot(cmd_t_trim - cmd_t_trim[0], cmd_x_trim * 1000, label="commanded")
+    axes[1].plot(fb_t_trim - cmd_t_trim[0], fb_x_trim * 1000, label="actual")
     axes[1].set_xlabel("time (s)")
-    axes[1].set_ylabel("X (m)")
-    axes[1].set_title("Raw signals")
+    axes[1].set_ylabel("camera X (mm)")
+    axes[1].set_title("Raw signals (trimmed)")
     axes[1].legend()
 
-    axes[2].plot(cmd_t - cmd_t[0], cmd_x, label="commanded")
-    axes[2].plot(
-        fb_t - cmd_t[0] - latency,
-        fb_x,
-        label=f"actual shifted -{latency * 1000:.1f} ms",
-    )
+    axes[2].plot(cmd_t_trim - cmd_t_trim[0], cmd_x_trim * 1000, label="commanded")
+    axes[2].plot(fb_t_trim - cmd_t_trim[0] - latency, fb_x_trim * 1000,
+                label=f"actual shifted -{latency * 1000:.1f}ms")
     axes[2].set_xlabel("time (s)")
-    axes[2].set_ylabel("X (m)")
+    axes[2].set_ylabel("camera X (mm)")
     axes[2].set_title("Aligned")
     axes[2].legend()
 
     plt.tight_layout()
     plt.savefig(PLOT_PATH, dpi=120)
-    print(f"Plot saved: {PLOT_PATH}")
+    print(f"[plot] Saved: {PLOT_PATH}")
 
 
 if __name__ == "__main__":

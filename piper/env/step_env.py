@@ -20,67 +20,13 @@ import time
 from collections import deque
 from typing import Dict, List, Optional, Tuple
 
-import cv2
 import numpy as np
-from scipy.spatial.transform import Rotation as R
 
 import pyindemind
 
 from piper.env.piper_driver import PiperDriver
-
-
-# ---------------------------------------------------------------------------
-# Pose math
-# ---------------------------------------------------------------------------
-
-
-def rot6d_to_matrix(rot6d: np.ndarray) -> np.ndarray:
-    """Decode 6D rotation [r00,r10,r20, r01,r11,r21] -> (3,3) via Gram-Schmidt.
-    Matches the layout in trace_dataset._relativize_poses."""
-    a1 = rot6d[:3]
-    a2 = rot6d[3:]
-    b1 = a1 / (np.linalg.norm(a1) + 1e-8)
-    b2 = a2 - np.dot(b1, a2) * b1
-    b2 = b2 / (np.linalg.norm(b2) + 1e-8)
-    b3 = np.cross(b1, b2)
-    return np.stack([b1, b2, b3], axis=-1)
-
-
-def _relativize(
-    positions: np.ndarray, rotvecs: np.ndarray, anchor_idx: int
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Relativize poses to the anchor step.
-
-    Returns (rel_pos, rel_rot_6d, anchor_mat) matching trace_dataset convention.
-    """
-    n = positions.shape[0]
-    pose_mat = np.zeros((n, 4, 4), dtype=np.float64)
-    pose_mat[:, :3, :3] = R.from_rotvec(rotvecs).as_matrix()
-    pose_mat[:, :3, 3] = positions
-    pose_mat[:, 3, 3] = 1.0
-
-    anchor = pose_mat[anchor_idx].copy()
-    anchor_inv = np.linalg.inv(anchor)
-    rel = anchor_inv @ pose_mat
-
-    rel_pos = rel[:, :3, 3].astype(np.float32)
-    rel_rot_6d = np.concatenate([rel[:, :3, 0], rel[:, :3, 1]], axis=-1).astype(
-        np.float32
-    )
-
-    return rel_pos, rel_rot_6d, anchor
-
-
-def _preprocess_image(img: np.ndarray, size: int = 224) -> np.ndarray:
-    """Grayscale (H,W) or (H,W,1) uint8 -> (3, size, size) float32 [0,1].
-
-    Matches trace_dataset._sample_to_data: resize, normalize, triplicate
-    so a 3-channel ResNet backbone can consume it."""
-    if img.ndim == 3:
-        img = img[..., 0]
-    img = cv2.resize(img, (size, size), interpolation=cv2.INTER_AREA)
-    img = img.astype(np.float32) / 255.0
-    return np.repeat(img[None], 3, axis=0)  # (3, H, W)
+from piper.common.pose_util import rot6d_to_matrix, relativize_poses, rel_action_to_world
+from piper.common.image_util import preprocess_image
 
 
 # ---------------------------------------------------------------------------
@@ -207,15 +153,15 @@ class StepEnv:
             return None
 
         cam0 = np.stack(
-            [_preprocess_image(s["cam0"], self.obs_image_size) for s in samples]
+            [preprocess_image(s["cam0"], self.obs_image_size) for s in samples]
         )
         cam1 = np.stack(
-            [_preprocess_image(s["cam1"], self.obs_image_size) for s in samples]
+            [preprocess_image(s["cam1"], self.obs_image_size) for s in samples]
         )
         positions = np.stack([s["cam_pos"] for s in samples])
         rotvecs = np.stack([s["cam_rot_axis_angle"] for s in samples])
 
-        rel_pos, rel_rot_6d, anchor = _relativize(
+        rel_pos, rel_rot_6d, anchor = relativize_poses(
             positions, rotvecs, anchor_idx=n_obs_steps - 1
         )
 
@@ -257,7 +203,7 @@ class StepEnv:
         world_poses = []
         for i in range(horizon.shape[0]):
             T_rel = np.eye(4)
-            T_rel[:3, :3] = rot6d_to_matrix(horizon[i, 3:])
+            # T_rel[:3, :3] = rot6d_to_matrix(horizon[i, 3:])
             T_rel[:3, 3] = horizon[i, :3]
             world_poses.append(anchor @ T_rel)
 
@@ -265,12 +211,14 @@ class StepEnv:
         print(f"[debug] anchor cam pos (m): {anchor[:3, 3]}")
         T_wrist_anchor = anchor @ np.linalg.inv(self.driver.tf_w2c)
         print(f"[debug] anchor wrist pos (m): {T_wrist_anchor[:3, 3]}")
-        for di in [0, min(7, len(world_poses)-1), len(world_poses)-1]:
+        for di in [0, min(7, len(world_poses) - 1), len(world_poses) - 1]:
             T_cam = world_poses[di]
             T_wrist = T_cam @ np.linalg.inv(self.driver.tf_w2c)
             rel_pos = horizon[di, :3]
-            print(f"[debug] step {di}: rel_pos={rel_pos*1000} mm  "
-                  f"cam_pos={T_cam[:3,3]}  wrist_pos={T_wrist[:3,3]}")
+            print(
+                f"[debug] step {di}: rel_pos={rel_pos*1000} mm  "
+                f"cam_pos={T_cam[:3,3]}  wrist_pos={T_wrist[:3,3]}"
+            )
 
         # execute with safety checks
         last_pos = anchor[:3, 3]
