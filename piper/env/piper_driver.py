@@ -1,19 +1,19 @@
 """Thin wrapper around the Piper SDK for camera-frame pose control.
 
-The policy predicts and observes in the **camera frame** (mounted on the
-wrist). This driver converts between that frame and the SDK's wrist-frame
-commands/feedback, handling:
-  - TF_WRIST_TO_CAMERA rigid transform
-  - SDK unit scaling (0.001 mm / 0.001 deg)
-  - Extrinsic XYZ euler convention
-  - Optional high-frequency interpolation controller for smooth motion
-    (UMI-style: trim+insert trajectory, max_pos/rot_speed rate limit)
+The policy predicts and observes in the camera frame (mounted on the wrist).
+This driver converts between that frame and the SDK's wrist-frame commands,
+handling the TF_WRIST_TO_CAMERA rigid transform, SDK unit scaling
+(0.001 mm / 0.001 deg), and extrinsic XYZ euler convention.
+
+With smooth=True, a background thread runs a PoseTrajectoryInterpolator
+at smooth_hz and streams EndPoseCtrl (MOVE P) commands. Callers submit
+waypoints via schedule_waypoint(); new waypoints trim-and-insert into the
+trajectory so overlapping predictions smoothly override the future plan.
 
 Usage:
-    driver = PiperDriver(smooth=True, send_hz=150)
-    pos, rotvec, T = driver.get_camera_pose()
-    driver.schedule_waypoint(T_world, target_time)   # smooth=True
-    driver.set_camera_pose(pos, rotvec)              # smooth=False
+    driver = PiperDriver(smooth=True, smooth_hz=150)
+    batch_id = driver.new_batch()
+    driver.schedule_waypoint(T_world_cam, target_time, batch_id)
 """
 
 import threading
@@ -30,11 +30,11 @@ from piper.env.pose_trajectory_interpolator import (
     pose6_to_mat,
 )
 
-# Piper SDK units
-_POS_TO_M = 1e-6  # 0.001 mm -> m  (feedback)
-_ROT_TO_DEG = 1e-3  # 0.001 deg -> deg (feedback)
-_M_TO_POS = 1_000_000  # m -> 0.001 mm (command)
-_DEG_TO_ROT = 1_000  # deg -> 0.001 deg (command)
+# Piper SDK unit conversions
+_POS_TO_M = 1e-6           # 0.001 mm -> m  (feedback)
+_ROT_TO_DEG = 1e-3         # 0.001 deg -> deg (feedback)
+_M_TO_POS = 1_000_000      # m -> 0.001 mm (command)
+_DEG_TO_ROT = 1_000        # deg -> 0.001 deg (command)
 
 TF_WRIST_TO_CAMERA = np.array(
     [
@@ -49,18 +49,19 @@ TF_WRIST_TO_CAMERA = np.array(
 class _InterpolationController(threading.Thread):
     """High-frequency sender driven by a PoseTrajectoryInterpolator.
 
-    Every tick: reads the interpolator at t_now, sends the pose via
-    EndPoseCtrl (MOVE P). New waypoints arrive via schedule_waypoint() and
-    get trim-and-inserted into the trajectory.
+    Every tick: evaluate the interpolator at t_now and send the pose via
+    EndPoseCtrl. New waypoints arrive via schedule_waypoint() and
+    trim-and-insert into the trajectory.
     """
 
     def __init__(
         self,
         driver: "PiperDriver",
-        send_hz: int = 150,
-        max_pos_speed: float = 0.5,  # m/s
-        max_rot_speed: float = 2.0,  # rad/s
-        verbose: bool = False,
+        send_hz: int,
+        max_pos_speed: float,   # m/s
+        max_rot_speed: float,   # rad/s
+        verbose: bool,
+        record: bool,
     ):
         super().__init__(daemon=True, name="PiperInterpController")
         self._driver = driver
@@ -68,36 +69,40 @@ class _InterpolationController(threading.Thread):
         self._max_pos_speed = max_pos_speed
         self._max_rot_speed = max_rot_speed
         self._verbose = verbose
+        self._record = record
 
         self._lock = threading.Lock()
         self._interp: PoseTrajectoryInterpolator | None = None
         self._last_waypoint_time: float = -float("inf")
+        self._batch_counter: int = 0
         self._stop_evt = threading.Event()
 
-        # Stats
+        # per-second verbose stats
         self._n_ticks = 0
         self._n_waypoints = 0
-        self._n_waypoints_rejected = 0
+        self._n_rejected = 0
 
-    def _init_trajectory(self):
-        """Seed the trajectory with the current camera pose."""
-        T_now = self._driver.get_camera_pose_mat()
-        pose6 = mat_to_pose6(T_now)
-        now = time.monotonic()
-        self._interp = PoseTrajectoryInterpolator(
-            times=np.array([now]), poses=np.array([pose6])
-        )
-        self._last_waypoint_time = now
+        # recording: populated iff record=True
+        self.sent_log: list = []          # [(t, pose6)]
+        self.waypoint_log: list = []      # [(target_time, pose6, batch_id)]
 
-    def schedule_waypoint(self, T_world_cam: np.ndarray, target_time: float):
-        """Insert a single camera-frame waypoint at target_time (monotonic)."""
+    # -- public API --
+
+    def new_batch(self) -> int:
+        with self._lock:
+            self._batch_counter += 1
+            return self._batch_counter
+
+    def schedule_waypoint(
+        self, T_world_cam: np.ndarray, target_time: float, batch_id: int = -1
+    ):
         pose6 = mat_to_pose6(np.asarray(T_world_cam))
         with self._lock:
             if self._interp is None:
-                return  # not started yet
+                return
             curr_time = time.monotonic()
             if target_time <= curr_time:
-                self._n_waypoints_rejected += 1
+                self._n_rejected += 1
                 return
             self._interp = self._interp.schedule_waypoint(
                 pose=pose6,
@@ -107,13 +112,28 @@ class _InterpolationController(threading.Thread):
                 curr_time=curr_time,
                 last_waypoint_time=self._last_waypoint_time,
             )
-            self._last_waypoint_time = max(
-                self._last_waypoint_time, target_time)
+            self._last_waypoint_time = max(self._last_waypoint_time, target_time)
             self._n_waypoints += 1
+            if self._record:
+                self.waypoint_log.append(
+                    (float(target_time), pose6.copy(), int(batch_id))
+                )
+
+    def stop(self):
+        self._stop_evt.set()
+
+    # -- thread main --
 
     def run(self):
-        self._init_trajectory()
-        # Set MOVE P mode once; we stream EndPoseCtrl below.
+        # seed trajectory with current pose
+        now = time.monotonic()
+        seed = mat_to_pose6(self._driver.get_camera_pose_mat())
+        self._interp = PoseTrajectoryInterpolator(
+            times=np.array([now]), poses=np.array([seed])
+        )
+        self._last_waypoint_time = now
+
+        # set MOVE P mode once; we stream EndPoseCtrl below
         self._driver.piper.MotionCtrl_2(0x01, 0x00, self._driver.speed_pct, 0x00)
 
         next_t = time.monotonic()
@@ -124,20 +144,21 @@ class _InterpolationController(threading.Thread):
                 interp = self._interp
             if interp is not None:
                 pose6 = interp(now)
-                self._driver._send_camera_pose_from_pose6(pose6)
+                self._driver._send_camera_pose6(pose6)
+                if self._record:
+                    self.sent_log.append((now, pose6.copy()))
             self._n_ticks += 1
 
             if self._verbose and (now - last_log) > 1.0:
                 elapsed = now - last_log
                 print(
                     f"[interp] {self._n_ticks / elapsed:.0f} Hz  "
-                    f"waypoints: +{self._n_waypoints} "
-                    f"(rejected {self._n_waypoints_rejected})",
+                    f"waypoints: +{self._n_waypoints} (rejected {self._n_rejected})",
                     flush=True,
                 )
                 self._n_ticks = 0
                 self._n_waypoints = 0
-                self._n_waypoints_rejected = 0
+                self._n_rejected = 0
                 last_log = now
 
             next_t += self._dt
@@ -145,11 +166,7 @@ class _InterpolationController(threading.Thread):
             if sleep > 0:
                 time.sleep(sleep)
             else:
-                # fell behind — reset to now to prevent runaway catch-up
-                next_t = time.monotonic()
-
-    def stop(self):
-        self._stop_evt.set()
+                next_t = time.monotonic()  # fell behind; reset
 
 
 class PiperDriver:
@@ -163,9 +180,9 @@ class PiperDriver:
         max_pos_speed: float = 0.5,
         max_rot_speed: float = 2.0,
         verbose_interp: bool = False,
+        record_interp: bool = False,
     ):
         self.speed_pct = speed_pct
-        self.smooth = smooth
         self.tf_w2c = np.array(tf_wrist_to_camera, dtype=np.float64)
         self.tf_c2w = np.linalg.inv(self.tf_w2c)
 
@@ -174,7 +191,6 @@ class PiperDriver:
         while not self.piper.EnablePiper():
             time.sleep(0.01)
         self.piper.GripperCtrl(0, 1000, 0x01, 0)
-        # Set MOVE P mode once; _InterpolationController also sets it on start.
         self.piper.MotionCtrl_2(0x01, 0x00, self.speed_pct, 0x00)
 
         self._interp_ctrl: _InterpolationController | None = None
@@ -185,6 +201,7 @@ class PiperDriver:
                 max_pos_speed=max_pos_speed,
                 max_rot_speed=max_rot_speed,
                 verbose=verbose_interp,
+                record=record_interp,
             )
             self._interp_ctrl.start()
 
@@ -193,19 +210,60 @@ class PiperDriver:
             self._interp_ctrl.stop()
             self._interp_ctrl.join(timeout=2.0)
 
-    # ------------------------------------------------------------------ read
+    # -- smooth-mode commands --
+
+    def new_batch(self) -> int:
+        """Bump the batch counter; used to tag waypoint_log entries."""
+        self._require_smooth()
+        return self._interp_ctrl.new_batch()
+
+    def schedule_waypoint(
+        self, T_world_cam: np.ndarray, target_time: float, batch_id: int = -1
+    ):
+        """Queue a camera-frame waypoint for the interp thread."""
+        self._require_smooth()
+        self._interp_ctrl.schedule_waypoint(T_world_cam, target_time, batch_id)
+
+    def get_recorded_logs(self):
+        """Return (sent_log, waypoint_log) if record_interp was enabled.
+
+        sent_log:     [(t, pose6)] — pose commanded to the arm at send_hz.
+        waypoint_log: [(target_time, pose6, batch_id)] — raw scheduled waypoints.
+        """
+        if self._interp_ctrl is None:
+            return [], []
+        return list(self._interp_ctrl.sent_log), list(self._interp_ctrl.waypoint_log)
+
+    def _require_smooth(self):
+        if self._interp_ctrl is None:
+            raise RuntimeError("requires smooth=True")
+
+    # -- direct commands (bypass interp thread) --
+
+    def set_camera_pose_mat(self, T_base_cam: np.ndarray):
+        self._send_camera_pose_mat(T_base_cam)
+
+    def set_camera_pose(self, pos_m: np.ndarray, rotvec_rad: np.ndarray):
+        T = np.eye(4)
+        T[:3, :3] = R.from_rotvec(rotvec_rad).as_matrix()
+        T[:3, 3] = pos_m
+        self._send_camera_pose_mat(T)
+
+    def set_camera_pose_euler(self, pos_m: np.ndarray, euler_deg: np.ndarray):
+        T = np.eye(4)
+        T[:3, :3] = R.from_euler("xyz", euler_deg, degrees=True).as_matrix()
+        T[:3, 3] = pos_m
+        self._send_camera_pose_mat(T)
+
+    # -- feedback --
 
     def get_wrist_pose_mat(self) -> np.ndarray:
         ep = self.piper.GetArmEndPoseMsgs().end_pose
-        x = ep.X_axis * _POS_TO_M
-        y = ep.Y_axis * _POS_TO_M
-        z = ep.Z_axis * _POS_TO_M
-        rx = ep.RX_axis * _ROT_TO_DEG
-        ry = ep.RY_axis * _ROT_TO_DEG
-        rz = ep.RZ_axis * _ROT_TO_DEG
+        pos = np.array([ep.X_axis, ep.Y_axis, ep.Z_axis]) * _POS_TO_M
+        euler_deg = np.array([ep.RX_axis, ep.RY_axis, ep.RZ_axis]) * _ROT_TO_DEG
         T = np.eye(4)
-        T[:3, :3] = R.from_euler("xyz", [rx, ry, rz], degrees=True).as_matrix()
-        T[:3, 3] = [x, y, z]
+        T[:3, :3] = R.from_euler("xyz", euler_deg, degrees=True).as_matrix()
+        T[:3, 3] = pos
         return T
 
     def get_camera_pose_mat(self) -> np.ndarray:
@@ -217,59 +275,14 @@ class PiperDriver:
         rotvec = R.from_matrix(T[:3, :3]).as_rotvec()
         return pos, rotvec, T
 
-    # ----------------------------------------------------------------- write
-
-    def schedule_waypoint(self, T_world_cam: np.ndarray, target_time: float):
-        """UMI-style: queue a camera-frame waypoint for the interp thread."""
-        if self._interp_ctrl is None:
-            raise RuntimeError("schedule_waypoint requires smooth=True")
-        self._interp_ctrl.schedule_waypoint(T_world_cam, target_time)
-
-    def set_camera_pose_mat(self, T_base_cam: np.ndarray):
-        """Non-smooth path: send directly. Bypasses interp thread."""
-        self._send_camera_pose_mat_raw(T_base_cam)
-
-    def _send_camera_pose_from_pose6(self, pose6: np.ndarray):
-        self._send_camera_pose_mat_raw(pose6_to_mat(pose6))
-
-    def _send_camera_pose_mat_raw(self, T_base_cam: np.ndarray):
-        T_base_wrist = T_base_cam @ self.tf_c2w
-        self._send_wrist_pose(T_base_wrist)
-
-    def set_camera_pose(self, pos_m: np.ndarray, rotvec_rad: np.ndarray):
-        T = np.eye(4)
-        T[:3, :3] = R.from_rotvec(rotvec_rad).as_matrix()
-        T[:3, 3] = pos_m
-        self.set_camera_pose_mat(T)
-
-    def set_camera_pose_euler(self, pos_m: np.ndarray, euler_deg: np.ndarray):
-        T = np.eye(4)
-        T[:3, :3] = R.from_euler("xyz", euler_deg, degrees=True).as_matrix()
-        T[:3, 3] = pos_m
-        self.set_camera_pose_mat(T)
-
-    def set_wrist_pose_mat(self, T_base_wrist: np.ndarray):
-        self._send_wrist_pose(T_base_wrist)
-
-    def _send_wrist_pose(self, T_base_wrist: np.ndarray):
-        x, y, z = T_base_wrist[:3, 3]
-        rx, ry, rz = R.from_matrix(T_base_wrist[:3, :3]).as_euler("xyz", degrees=True)
-        X = round(x * _M_TO_POS)
-        Y = round(y * _M_TO_POS)
-        Z = round(z * _M_TO_POS)
-        RX = round(rx * _DEG_TO_ROT)
-        RY = round(ry * _DEG_TO_ROT)
-        RZ = round(rz * _DEG_TO_ROT)
-        # Note: MOVE P mode is set once at init / on interp start; not per-command.
-        self.piper.EndPoseCtrl(X, Y, Z, RX, RY, RZ)
-
-    # --------------------------------------------------------------- status
-
     def get_arm_status(self):
+        """Full status message (arm_status, motion_status, err_status, ...)."""
         return self.piper.GetArmStatus().arm_status
 
-    def is_target_reachable(self) -> bool:
-        return self.get_arm_status().arm_status == 0
+    def get_arm_status_code(self) -> int:
+        """Just the top-level arm_status byte (0 = OK, 0x04 = pos exceeds limit, ...)."""
+        s = self.get_arm_status()
+        return int(getattr(s, "arm_status", s))
 
     def print_status(self):
         s = self.get_arm_status()
@@ -277,6 +290,24 @@ class PiperDriver:
             f"arm_status={s.arm_status}  "
             f"motion_status={s.motion_status}  "
             f"err_status={s.err_status}"
+        )
+
+    # -- internal send path --
+
+    def _send_camera_pose6(self, pose6: np.ndarray):
+        self._send_camera_pose_mat(pose6_to_mat(pose6))
+
+    def _send_camera_pose_mat(self, T_base_cam: np.ndarray):
+        T_base_wrist = T_base_cam @ self.tf_c2w
+        xyz = T_base_wrist[:3, 3]
+        rxryrz = R.from_matrix(T_base_wrist[:3, :3]).as_euler("xyz", degrees=True)
+        self.piper.EndPoseCtrl(
+            round(xyz[0] * _M_TO_POS),
+            round(xyz[1] * _M_TO_POS),
+            round(xyz[2] * _M_TO_POS),
+            round(rxryrz[0] * _DEG_TO_ROT),
+            round(rxryrz[1] * _DEG_TO_ROT),
+            round(rxryrz[2] * _DEG_TO_ROT),
         )
 
 

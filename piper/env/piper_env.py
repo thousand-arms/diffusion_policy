@@ -195,51 +195,35 @@ class PiperEnv:
         actions: np.ndarray,
         timestamps: np.ndarray,
         anchor_mat: np.ndarray,
-        compensate_latency: bool = True,
-        verbose: bool = False,
     ) -> int:
         """Non-blocking: queue camera-frame waypoints into the interp thread.
 
+        Converts each action to a world-frame pose, subtracts robot latency
+        from its target time so the arm physically arrives at the original
+        timestamp, and schedules via the driver's interpolator.
+
         Args:
-            actions:    (N, 9) relative actions (pos3 + rot6d6).
-            timestamps: (N,) monotonic timestamps — when to arrive.
-            anchor_mat: (4, 4) world-frame anchor pose.
-            compensate_latency: subtract robot_action_latency from target_time
-                so the arm physically arrives at timestamp[i].
+            actions:    (N, 9) relative actions (pos3 + rot6d6) in anchor frame.
+            timestamps: (N,) monotonic target arrival times.
+            anchor_mat: (4, 4) world-frame anchor pose from get_obs().
 
-        Returns number of waypoints scheduled (post safety filter).
+        Returns the number of waypoints successfully scheduled.
+        Breaks early on any waypoint whose world-frame pose is farther than
+        max_step_m from the current arm position (safety stop).
         """
-        if self.driver._interp_ctrl is None:
-            raise RuntimeError(
-                "PiperEnv.exec_actions requires driver smooth=True")
-
         current_pos = self.driver.get_camera_pose_mat()[:3, 3]
+        batch_id = self.driver.new_batch()
+
         n_sent = 0
-        n_skipped_far = 0
-
-        r_latency = self.robot_action_latency if compensate_latency else 0.0
-
-        max_delta = 0.0
-        for i in range(len(actions)):
-            T_world = rel_action_to_world(actions[i], anchor_mat)
-            target_pos = T_world[:3, 3]
-            delta = np.linalg.norm(target_pos - current_pos)
-            max_delta = max(max_delta, delta)
+        for action, t in zip(actions, timestamps):
+            T_world = rel_action_to_world(action, anchor_mat)
+            delta = np.linalg.norm(T_world[:3, 3] - current_pos)
             if delta > self.max_step_m:
-                n_skipped_far += 1
-                # don't break — later actions in horizon may be fine,
-                # but conservatively stop to avoid teleport across obstacles
                 break
-            target_time = float(timestamps[i]) - r_latency
-            self.driver.schedule_waypoint(T_world, target_time)
-            n_sent += 1
-
-        if verbose:
-            print(
-                f"[exec_actions] scheduled {n_sent}/{len(actions)}  "
-                f"max_delta={max_delta*1000:.1f}mm  skipped_far={n_skipped_far}",
-                flush=True,
+            self.driver.schedule_waypoint(
+                T_world, float(t) - self.robot_action_latency, batch_id
             )
+            n_sent += 1
         return n_sent
 
     # --------------------------------------------------------------- preview
