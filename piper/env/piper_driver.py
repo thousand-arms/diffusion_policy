@@ -77,6 +77,7 @@ class _InterpolationController(threading.Thread):
         self._last_waypoint_time: float = -float("inf")
         self._batch_counter: int = 0
         self._stop_evt = threading.Event()
+        self._send_paused = threading.Event()  # set -> skip EndPoseCtrl sends
 
         # per-second verbose stats
         self._n_ticks = 0
@@ -130,6 +131,26 @@ class _InterpolationController(threading.Thread):
     def stop(self):
         self._stop_evt.set()
 
+    def pause_send(self):
+        self._send_paused.set()
+
+    def resume_send(self):
+        self._send_paused.clear()
+
+    def reseed(self):
+        """Replace the interpolator with a single point at the current pose.
+
+        Used after manual arm movement (pause + drag-teach) so the interp
+        doesn't snap the arm back to its pre-pause trajectory on resume.
+        """
+        seed = mat_to_pose6(self._driver.get_camera_pose_mat())
+        now = time.monotonic()
+        with self._lock:
+            self._interp = PoseTrajectoryInterpolator(
+                times=np.array([now]), poses=np.array([seed])
+            )
+            self._last_waypoint_time = now
+
     # -- thread main --
 
     def run(self):
@@ -148,13 +169,14 @@ class _InterpolationController(threading.Thread):
         last_log = next_t
         while not self._stop_evt.is_set():
             now = time.monotonic()
-            with self._lock:
-                interp = self._interp
-            if interp is not None:
-                pose6 = interp(now)
-                self._driver._send_camera_pose6(pose6)
-                if self._record:
-                    self.sent_log.append((now, pose6.copy()))
+            if not self._send_paused.is_set():
+                with self._lock:
+                    interp = self._interp
+                if interp is not None:
+                    pose6 = interp(now)
+                    self._driver._send_camera_pose6(pose6)
+                    if self._record:
+                        self.sent_log.append((now, pose6.copy()))
             self._n_ticks += 1
 
             if self._verbose and (now - last_log) > 1.0:
@@ -217,6 +239,37 @@ class PiperDriver:
         if self._interp_ctrl is not None:
             self._interp_ctrl.stop()
             self._interp_ctrl.join(timeout=2.0)
+
+    # -- control-mode helpers --
+
+    def ensure_enabled(self):
+        """Idempotently re-enable the arm and restore MOVE P mode."""
+        self.piper.EnablePiper()
+        self.piper.MotionCtrl_2(0x01, 0x00, self.speed_pct, 0x00)
+
+    def enter_drag_teach(self):
+        """Put the arm in gravity-comp drag-teach mode (hand-movable).
+
+        Also pauses the interp send thread so no EndPoseCtrl commands
+        compete with teach mode.
+        """
+        if self._interp_ctrl is not None:
+            self._interp_ctrl.pause_send()
+        self.piper.MotionCtrl_1(0x00, 0x00, 0x01)
+
+    def exit_drag_teach(self):
+        """Reseed interp to the current actual pose, exit teach mode, and
+        resume interp sends. Safe regardless of prior state."""
+        if self._interp_ctrl is not None:
+            self._interp_ctrl.reseed()
+            self._interp_ctrl.resume_send()
+        self.piper.MotionCtrl_1(0x00, 0x00, 0x02)
+        self.piper.MotionCtrl_2(0x01, 0x00, self.speed_pct, 0x00)
+
+    def reseed_interp(self):
+        """Snap the interpolator to hold at the current actual pose."""
+        self._require_smooth()
+        self._interp_ctrl.reseed()
 
     # -- smooth-mode commands --
 

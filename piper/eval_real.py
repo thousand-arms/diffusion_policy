@@ -20,8 +20,6 @@ import click
 import cv2
 import numpy as np
 import torch
-import yaml
-from scipy.spatial.transform import Rotation as R
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -29,26 +27,12 @@ sys.path.insert(0, str(ROOT))
 from diffusion_policy.common.precise_sleep import precise_wait
 from piper.common.checkpoint_util import load_policy
 from piper.common.viz import plot_trajectory
+from piper.env.camera_poses import CAMERA_POSES_PATH, load_camera_poses
 from piper.env.piper_driver import PiperDriver
 from piper.env.piper_env import PiperEnv, CAMERA_OBS_LATENCY_S, ROBOT_ACTION_LATENCY_S
 
 
 _OBS_NON_TENSOR_KEYS = ("timestamp", "anchor_mat")
-
-DEFAULT_POSE_PATH = ROOT / "piper" / "env" / "default_cam_pose.yaml"
-
-
-def _load_default_pose_mat(path: pathlib.Path) -> np.ndarray | None:
-    if not path.exists() or path.stat().st_size == 0:
-        return None
-    with path.open() as f:
-        data = yaml.safe_load(f)
-    if not data:
-        return None
-    T = np.eye(4)
-    T[:3, :3] = R.from_rotvec(data["rot_axis_angle_rad"]).as_matrix()
-    T[:3, 3] = data["pos_m"]
-    return T
 
 
 def _obs_to_torch(obs: dict, device: torch.device) -> dict:
@@ -101,7 +85,7 @@ def _preview_loop(
     print("[ready] (s)tart policy | (r)eset to default pose | (q)uit")
     if default_pose_mat is None:
         print("[ready] note: no default pose saved — 'r' will be ignored. "
-              "Run `python -m piper.scripts.set_default_camera_pose` first.")
+              "Run `python -m piper.scripts.record_camera_poses` first.")
     while True:
         preview = env.get_preview()
         if preview is not None:
@@ -117,6 +101,28 @@ def _preview_loop(
                 _trigger_reset(driver, default_pose_mat, reset_speed_m_s)
         if key in (ord("q"), 27):
             return "quit"
+
+
+def _paused_loop(driver: PiperDriver, env: PiperEnv, window: str) -> str:
+    """Arm in drag-teach (hand-movable), inference paused.
+
+    Returns one of 'resume', 'reset', 'quit'.
+    """
+    driver.enter_drag_teach()
+    try:
+        print("[paused] drag-teach ON — hand-move the arm. "
+              "(s)resume inference | (r)eset to default | (q)uit")
+        while True:
+            _draw_preview(env, window, "PAUSED — drag-teach")
+            key = cv2.waitKey(30) & 0xFF
+            if key == ord("s"):
+                return "resume"
+            if key == ord("r"):
+                return "reset"
+            if key in (ord("q"), 27):
+                return "quit"
+    finally:
+        driver.exit_drag_teach()
 
 
 def _select_new_actions(
@@ -176,8 +182,8 @@ def _draw_preview(env: PiperEnv, window: str, text: str):
 @click.option("--verbose-interp", is_flag=True, help="print interp thread stats")
 @click.option("--visualize", is_flag=True,
               help="record scheduled waypoints + sent poses and plot after stop")
-@click.option("--default-pose", default=str(DEFAULT_POSE_PATH), type=click.Path(),
-              help="yaml with pos_m + rot_axis_angle_rad for the 'r' reset pose")
+@click.option("--poses", default=str(CAMERA_POSES_PATH), type=click.Path(),
+              help="yaml with 'default' + 'keyframes' (this script only uses 'default')")
 @click.option("--reset-speed-m-s", default=0.08, type=float,
               help="linear speed for the 'r' reset motion (m/s)")
 def main(
@@ -195,7 +201,7 @@ def main(
     dry_run,
     verbose_interp,
     visualize,
-    default_pose,
+    poses,
     reset_speed_m_s,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -238,41 +244,71 @@ def main(
             policy.predict_action(_obs_to_torch(env.get_obs(), device))
         print("[warmup] done.")
 
-        default_pose_mat = _load_default_pose_mat(pathlib.Path(default_pose))
+        default_pose_mat, _keyframes = load_camera_poses(pathlib.Path(poses))
         if default_pose_mat is None:
-            print(f"[default-pose] none loaded from {default_pose}")
+            print(f"[default-pose] none loaded from {poses}")
         else:
-            print(f"[default-pose] loaded from {default_pose}")
+            print(f"[default-pose] loaded from {poses}")
 
         window = "eval_real"
         cv2.namedWindow(window, cv2.WINDOW_AUTOSIZE)
         reset_enabled = (not dry_run) and default_pose_mat is not None
         reset_pose = default_pose_mat if reset_enabled else None
 
-        while True:
-            action = _preview_loop(
-                env, driver, window, reset_pose,
-                reset_speed_m_s=reset_speed_m_s,
-            )
-            if action == "quit":
-                break
-            session_t_start, exit_reason = _run_policy_loop(
-                env, driver, policy, device,
-                dt=dt,
-                horizon=horizon,
-                steps_per_inference=steps_per_inference,
-                max_duration=max_duration,
-                action_exec_latency=action_exec_latency,
-                dry_run=dry_run,
-                window=window,
-            )
-            if t_start is None:
-                t_start = session_t_start
-            if exit_reason == "reset":
-                if reset_pose is not None:
-                    _trigger_reset(driver, reset_pose, reset_speed_m_s)
-                continue
-            break  # quit or timeout
+        state = "preview"
+        while state != "quit":
+            if state == "preview":
+                action = _preview_loop(
+                    env, driver, window, reset_pose,
+                    reset_speed_m_s=reset_speed_m_s,
+                )
+                state = "run" if action == "start" else "quit"
+
+            elif state == "run":
+                # Ensure the arm is enabled + in MOVE P mode before every
+                # inference entry (preview-start, pause-resume, etc.).
+                if not dry_run:
+                    driver.ensure_enabled()
+                    driver.reseed_interp()
+                session_t_start, exit_reason = _run_policy_loop(
+                    env, driver, policy, device,
+                    dt=dt,
+                    horizon=horizon,
+                    steps_per_inference=steps_per_inference,
+                    max_duration=max_duration,
+                    action_exec_latency=action_exec_latency,
+                    dry_run=dry_run,
+                    window=window,
+                )
+                if t_start is None:
+                    t_start = session_t_start
+                if exit_reason == "pause":
+                    state = "paused"
+                elif exit_reason == "reset":
+                    if reset_pose is not None:
+                        _trigger_reset(driver, reset_pose, reset_speed_m_s)
+                    state = "preview"
+                elif exit_reason == "quit":
+                    state = "quit"
+                else:  # timeout
+                    state = "preview"
+
+            elif state == "paused":
+                if dry_run:
+                    print("[paused] drag-teach disabled under --dry-run; "
+                          "returning to preview.")
+                    state = "preview"
+                    continue
+                action = _paused_loop(driver, env, window)
+                if action == "resume":
+                    state = "run"
+                elif action == "reset":
+                    if reset_pose is not None:
+                        driver.ensure_enabled()
+                        _trigger_reset(driver, reset_pose, reset_speed_m_s)
+                    state = "preview"
+                else:  # quit
+                    state = "quit"
     finally:
         if visualize and t_start is not None:
             sent_log, waypoint_log = driver.get_recorded_logs()
@@ -292,7 +328,7 @@ def _run_policy_loop(
     """Synchronous inference loop. Scheduling is non-blocking.
 
     Returns (t_start, exit_reason) where exit_reason is one of
-    'reset' | 'quit' | 'timeout'.
+    'reset' | 'pause' | 'quit' | 'timeout'.
     """
     t_start = time.monotonic()
     iter_idx = 0
@@ -300,7 +336,7 @@ def _run_policy_loop(
     total_sent = 0
     exit_reason = "timeout"
 
-    print("[running] policy control active. (r)eset, (q)uit.")
+    print("[running] policy control active. (p)ause | (r)eset | (q)uit")
 
     while True:
         t_cycle_start = time.monotonic()
@@ -355,7 +391,11 @@ def _run_policy_loop(
             break
         if key == ord("r"):
             exit_reason = "reset"
-            print("[pause] inference paused — resetting to default pose.")
+            print("[reset] inference paused — resetting to default pose.")
+            break
+        if key == ord("p"):
+            exit_reason = "pause"
+            print("[pause] inference paused — entering drag-teach.")
             break
 
         # Grab fresh obs at next cycle rather than the exact boundary
