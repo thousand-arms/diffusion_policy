@@ -15,6 +15,7 @@ Usage:
     batch_id = driver.new_batch()
     driver.schedule_waypoint(T_world_cam, target_time, batch_id)
 """
+from __future__ import annotations
 
 import threading
 import time
@@ -94,9 +95,16 @@ class _InterpolationController(threading.Thread):
             return self._batch_counter
 
     def schedule_waypoint(
-        self, T_world_cam: np.ndarray, target_time: float, batch_id: int = -1
+        self,
+        T_world_cam: np.ndarray,
+        target_time: float,
+        batch_id: int = -1,
+        max_pos_speed: float | None = None,
+        max_rot_speed: float | None = None,
     ):
         pose6 = mat_to_pose6(np.asarray(T_world_cam))
+        pos_cap = self._max_pos_speed if max_pos_speed is None else max_pos_speed
+        rot_cap = self._max_rot_speed if max_rot_speed is None else max_rot_speed
         with self._lock:
             if self._interp is None:
                 return
@@ -107,8 +115,8 @@ class _InterpolationController(threading.Thread):
             self._interp = self._interp.schedule_waypoint(
                 pose=pose6,
                 time=target_time,
-                max_pos_speed=self._max_pos_speed,
-                max_rot_speed=self._max_rot_speed,
+                max_pos_speed=pos_cap,
+                max_rot_speed=rot_cap,
                 curr_time=curr_time,
                 last_waypoint_time=self._last_waypoint_time,
             )
@@ -218,11 +226,24 @@ class PiperDriver:
         return self._interp_ctrl.new_batch()
 
     def schedule_waypoint(
-        self, T_world_cam: np.ndarray, target_time: float, batch_id: int = -1
+        self,
+        T_world_cam: np.ndarray,
+        target_time: float,
+        batch_id: int = -1,
+        max_pos_speed: float | None = None,
+        max_rot_speed: float | None = None,
     ):
-        """Queue a camera-frame waypoint for the interp thread."""
+        """Queue a camera-frame waypoint for the interp thread.
+
+        max_pos_speed / max_rot_speed override the driver-level caps for
+        this one waypoint — useful for a slow, safety-capped reset motion
+        without throttling policy control.
+        """
         self._require_smooth()
-        self._interp_ctrl.schedule_waypoint(T_world_cam, target_time, batch_id)
+        self._interp_ctrl.schedule_waypoint(
+            T_world_cam, target_time, batch_id,
+            max_pos_speed=max_pos_speed, max_rot_speed=max_rot_speed,
+        )
 
     def get_recorded_logs(self):
         """Return (sent_log, waypoint_log) if record_interp was enabled.
