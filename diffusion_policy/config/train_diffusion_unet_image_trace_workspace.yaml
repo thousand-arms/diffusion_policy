@@ -113,6 +113,11 @@ training:
   seed: 42
   debug: False
   resume: True
+  # Fine-tune: when set and no latest.ckpt exists in this run's output_dir,
+  # load model + ema_model weights from this checkpoint (optimizer/epoch/
+  # global_step stay fresh). Once latest.ckpt is produced here, normal
+  # resume takes over.
+  init_weights_from: null
   # optimization
   lr_scheduler: cosine
   lr_warmup_steps: 500

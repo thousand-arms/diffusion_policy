@@ -69,6 +69,20 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
             if lastest_ckpt_path.is_file():
                 print(f"Resuming from checkpoint {lastest_ckpt_path}")
                 self.load_checkpoint(path=lastest_ckpt_path)
+            elif cfg.training.get('init_weights_from', None):
+                # Fine-tune: load model + ema weights from a foreign run,
+                # but keep optimizer/global_step/epoch fresh. Skipped once
+                # this run has its own latest.ckpt so subsequent resumes
+                # pick up where the fine-tune left off.
+                init_path = pathlib.Path(cfg.training.init_weights_from)
+                assert init_path.is_file(), \
+                    f"training.init_weights_from does not exist: {init_path}"
+                print(f"Initializing model + EMA weights from {init_path} "
+                      f"(fresh optimizer, epoch=0)")
+                self.load_checkpoint(
+                    path=init_path,
+                    exclude_keys=['optimizer'],
+                    include_keys=[])
 
         # configure dataset
         dataset: BaseImageDataset
